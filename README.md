@@ -10,52 +10,6 @@
 
 ---
 
-Fillado/
-├── backend/
-│   ├── main.py                   # FastAPI app entrypoint (WebSockets, REST)
-│   ├── requirements.txt
-│   ├── agents/
-│   │   ├── __init__.py
-│   │   ├── trading_floor.py      # LangGraph multi-agent debate graph
-│   │   └── synthesis_agent.py    # Synthesis + graph writer agent
-│   ├── middleware/
-│   │   ├── __init__.py
-│   │   └── thought_policeman.py  # Semantic drift detector (Groq 8B)
-│   ├── graph/
-│   │   ├── __init__.py
-│   │   └── graphrag.py           # GraphRAGTransformer (Neo4j + Groq 8B)
-│   └── core/
-│       ├── __init__.py
-│       └── config.py             # Pydantic settings from .env
-├── mcp_server/
-│   ├── __init__.py
-│   ├── server.py                 # FastAPI MCP sub-app (tool definitions)
-│   └── tools/
-│       ├── __init__.py
-│       ├── read_tools.py         # fetch_et_news_mock, get_nse_price_mock, etc.
-│       └── write_tools.py        # append_causal_link (Neo4j Cypher write)
-├── frontend/
-│   ├── index.html
-│   ├── package.json
-│   ├── vite.config.js
-│   ├── tailwind.config.js
-│   └── src/
-│       ├── main.jsx
-│       ├── App.jsx
-│       ├── index.css
-│       ├── components/
-│       │   ├── Dashboard.jsx          # Alert radar / feed
-│       │   ├── TradingFloor.jsx       # Rotating triangle + debate stream
-│       │   ├── AgentNode.jsx          # Circular PFP node
-│       │   ├── SpeechBubble.jsx       # Streaming text bubble
-│       │   ├── HallucinationBadge.jsx # Red "Context Corrected" badge
-│       │   ├── GraphViz.jsx           # Causal chain visualization
-│       │   └── TradingSignal.jsx      # Final synthesized signal
-│       └── hooks/
-│           └── useWebSocket.js        # WS hook for streaming
-├── .env.example
-├── docker-compose.yml
-└── README.md (existing)
 
 # Product Requirements Document (PRD)
 
