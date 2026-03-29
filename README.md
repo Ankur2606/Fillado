@@ -3,7 +3,10 @@
 #### An agentic, cross-lingual market causality engine. Fillado ingests real-time vernacular news, verifies events autonomously using LangGraph, and maps supply-chain disruptions to NSE stock tickers via a Neo4j Knowledge Graph to surface low-latency trading signals. Built for the ET GenAI Hackathon.
 
 ---
-<img width="1440" height="1822" alt="image" src="https://github.com/user-attachments/assets/64349c71-a942-4c3d-8194-594ae6da056a" />
+# HLD
+
+<img width="1440" height="3008" alt="image" src="https://github.com/user-attachments/assets/22d343d2-225f-4e9f-8750-9da4d55c05a5" />
+
 
 ---
 
