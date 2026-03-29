@@ -154,17 +154,15 @@ async def _broadcast(message: dict):
 
 RETAIL_SYSTEM = """You are "Ravi" – an enthusiastic retail trader on Zerodha.
 You believe any local disruption is a massive opportunity. You talk about momentum,
-delivery volumes, and social media sentiment. Keep replies to 3-4 punchy sentences.
-Always mention at least one NSE ticker symbol."""
+delivery volumes, and social media sentiment. Write out your analysis fully in 3-4 natural sentences. DO NOT output single word abbreviations like 'ns' or 'nt'. Always mention at least one NSE ticker symbol."""
 
 WHALE_SYSTEM = """You are "The Whale" – an institutional fund manager handling ₹5,000 Cr.
 You rely on supply-chain data, sector rotation models, and macro positioning.
-You always cite quantitative data from the graph. Keep replies to 3-4 analytical sentences.
-Name the sector impact and specific ticker symbols."""
+You always cite quantitative data from the graph. Write out your analysis fully in 3-4 natural analytical sentences. DO NOT output single word abbreviations."""
 
 CONTRARIAN_SYSTEM = """You are "Vikram" – a contrarian trader who profits from reversals.
 You challenge consensus, look for the opposite trade, and highlight structural headwinds.
-Keep replies to 3-4 contrarian sentences. Disagree with the last speaker and justify with data."""
+Write out your analysis fully in 3-4 natural contrarian sentences. Disagree with the last speaker and justify with data. DO NOT output single word abbreviations."""
 
 SYNTHESIS_SYSTEM = """You are the "Synthesis Agent" — you read the full debate and surface a
 final objective trading signal. Produce ONLY valid JSON (no markdown) with these keys:
@@ -377,6 +375,7 @@ async def _run_agent_turn(
         await _broadcast({"type": "mcp_tool", "tool": "fetch_et_news_mock", "data": news})
 
     try:
+        await asyncio.sleep(2) # Artificial slow down / pacing
         async for chunk in _stream_groq(system_prompt, user_prompt, model=MODEL_FAST_STREAM):
             buffer += chunk
             token_count += 1
@@ -457,6 +456,7 @@ async def _run_agent_turn_live(
     # ── Call 1: Tool Decision ────────────────────────────────────────────────
     tool_calls_made = []
     try:
+        await asyncio.sleep(4) # Rate-limit delay
         print(f"[{persona_name}] Call 1 → tool decision ({MODEL_LIVE_REASONING})")
         resp1 = await client.chat.completions.create(
             model=MODEL_LIVE_REASONING,
@@ -534,7 +534,8 @@ async def _run_agent_turn_live(
     })
 
     try:
-        print(f"[{persona_name}] Call 2 \u2192 streaming final answer ({MODEL_LIVE_REASONING})")
+        await asyncio.sleep(2) # Added a delay between calls
+        print(f"[{persona_name}] Call 2 → streaming final answer ({MODEL_LIVE_REASONING})")
         stream = await client.chat.completions.create(
             model=MODEL_LIVE_REASONING,
             messages=messages,
@@ -650,7 +651,13 @@ async def synthesis_node(state: DebateState) -> DebateState:
     stock_charts = dict(state.get("stock_charts", {}))
 
     try:
+        import re
         clean = raw.replace("```json", "").replace("```", "").strip()
+        clean = re.sub(r'<think>.*?</think>', '', clean, flags=re.DOTALL).strip()
+        start = clean.find('{')
+        end = clean.rfind('}')
+        if start != -1 and end != -1:
+            clean = clean[start:end+1]
         signal = json.loads(clean)
     except Exception as exc:
         logger.warning(f"[synthesis_node] JSON parse failed: {exc}")
@@ -698,7 +705,13 @@ async def synthesis_node(state: DebateState) -> DebateState:
             except Exception as exc:
                 logger.error(f"[synthesis_node] append_causal_link failed: {exc}")
 
-    await _broadcast({"type": "synthesis_complete", "signal": signal, "causal_chain": causal_chain})
+    await _broadcast({
+        "type": "synthesis_complete", 
+        "signal": signal, 
+        "causal_chain": causal_chain,
+        "topic": state.get("topic", "Market Event"),
+        "messages": state.get("messages", [])
+    })
 
     return {
         **state,
