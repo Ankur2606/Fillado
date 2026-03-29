@@ -110,7 +110,7 @@ export default function StockChart({ ticker, data, currentPrice, changePct, mode
           color: mode === 'live' ? '#10b981' : 'var(--text-muted)',
           fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.08em',
         }}>
-          {mode === 'live' ? '● LIVE' : '◎ MOCK'}
+          {mode === 'live' ? '● LIVE' : '◎ SHOWDOWN'}
         </span>
       </div>
 

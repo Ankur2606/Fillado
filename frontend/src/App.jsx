@@ -4,9 +4,10 @@ import './index.css'
 import Dashboard from './components/Dashboard'
 import TradingFloor from './components/TradingFloor'
 import DebateHistory from './components/DebateHistory'
+import GraphIntelligence from './components/GraphIntelligence'
 import { useWebSocket } from './hooks/useWebSocket'
 
-const TABS = ['dashboard', 'trading-floor']
+const TABS = ['dashboard', 'trading-floor', 'graph']
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard')
@@ -68,6 +69,7 @@ export default function App() {
             {[
               { id: 'dashboard', label: '📡 Radar', },
               { id: 'trading-floor', label: '🎯 Trading Floor', badge: isDebating ? 'LIVE' : null },
+              { id: 'graph', label: '🕸 Knowledge Graph' },
             ].map(tab => (
               <button
                 key={tab.id}
@@ -263,6 +265,18 @@ export default function App() {
                   />
                 </div>
               )}
+            </motion.div>
+          )}
+
+          {activeTab === 'graph' && (
+            <motion.div
+              key="graph"
+              initial={{ opacity: 0, scale: 0.98 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.98 }}
+              transition={{ duration: 0.25 }}
+            >
+              <GraphIntelligence />
             </motion.div>
           )}
         </AnimatePresence>

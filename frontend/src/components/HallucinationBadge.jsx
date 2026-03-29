@@ -16,9 +16,9 @@ export default function HallucinationBadge({ visible, speaker, tool, count = 1 }
           exit={{ opacity: 0, x: 30, scale: 0.85 }}
           transition={{ type: 'spring', stiffness: 300, damping: 22 }}
           style={{
-            position: 'fixed',
-            top: 20, right: 20,
-            zIndex: 1000,
+            position: 'absolute',
+            top: -20, right: 0,
+            zIndex: 100,
             display: 'flex', flexDirection: 'column', gap: 8,
             maxWidth: 340,
           }}

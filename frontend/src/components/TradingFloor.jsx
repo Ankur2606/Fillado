@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import AgentNode from './AgentNode'
 import SpeechBubble from './SpeechBubble'
@@ -23,7 +23,7 @@ const PERSONA_ORDER_MAP = { retail: 0, whale: 1, contrarian: 2 }
 // Position 0 = top-right (~1 o'clock), 1 = bottom-centre, 2 = top-left
 const TRIANGLE_POSITIONS = [
   { x: 110, y: -90 },  // top-right  (active speaker slot)
-  { x: 0,   y: 100 },  // bottom-centre
+  { x: 0, y: 100 },  // bottom-centre
   { x: -110, y: -90 }, // top-left
 ]
 
@@ -42,6 +42,12 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
   const [transcripts, setTranscripts] = useState({
     retail: '', whale: '', contrarian: '', synthesis: '',
   })
+  // Maintain a chronological array of all completed turns for the history list
+  const [chatHistory, setChatHistory] = useState([])
+  // Typewriter state
+  const [typewriterTarget, setTypewriterTarget] = useState(null) // {speaker, text}
+  const typewriterRef = useRef(null)
+  const typewriterIdx = useRef(0)
   const [hallucinationEvents, setHallucinationEvents] = useState([])
   const [latestHallucination, setLatestHallucination] = useState(null)
   const [showBadge, setShowBadge] = useState(false)
@@ -50,12 +56,12 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
   const [graphContext, setGraphContext] = useState({})
   const [finalSignal, setFinalSignal] = useState(null)
   const [causalChain, setCausalChain] = useState([])
-  const [debatePhase, setDebatePhase] = useState('idle') // idle | debating | complete
+  const [debatePhase, setDebatePhase] = useState('idle')
   const [mcpToolCalls, setMcpToolCalls] = useState([])
   const [rotationDeg, setRotationDeg] = useState(0)
   const [errorMsg, setErrorMsg] = useState(null)
-  const [stockCharts, setStockCharts] = useState({})  // ticker → { data, currentPrice, changePct, mode }
-  const [debateMode, setDebateMode] = useState('MOCK') // MOCK | LIVE
+  const [stockCharts, setStockCharts] = useState({})
+  const [debateMode, setDebateMode] = useState('SHOWDOWN')
 
   const badgeTimer = useRef(null)
   const scrollRef = useRef(null)
@@ -71,6 +77,7 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
       case 'debate_start':
         setDebatePhase('debating')
         setTranscripts({ retail: '', whale: '', contrarian: '', synthesis: '' })
+        setChatHistory([])
         setFinalSignal(null)
         setCausalChain([])
         setHallucinationEvents([])
@@ -92,8 +99,22 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
         break
       }
 
+      // ── New: full buffered response from backend, fake-stream it ──
+      case 'agent_response': {
+        const { speaker, content } = msg
+        if (!speaker || !content) break
+        // Append full turn to chronological chat history
+        setChatHistory(prev => [...prev, { speaker, content, id: Date.now() + Math.random() }])
+        // Kick off typewriter effect for the active speaker
+        setTypewriterTarget({ speaker, text: content })
+        typewriterIdx.current = 0
+        setTranscripts(prev => ({ ...prev, [speaker]: '' })) // reset for fresh animation
+        break
+      }
+
+      // Legacy token handler kept for backwards compat (mock bursts etc)
       case 'token':
-        if (msg.speaker && msg.content) {
+        if (msg.speaker && msg.content && !typewriterRef.current) {
           setTranscripts(prev => ({
             ...prev,
             [msg.speaker]: (prev[msg.speaker] || '') + msg.content,
@@ -112,7 +133,16 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
       }
 
       case 'mcp_tool': {
-        const call = { tool: msg.tool, data: msg.data, timestamp: Date.now() }
+        // Build a richer label from the tool data
+        const d = msg.data || {}
+        let detail = ''
+        if (d.tier) detail += ` [tier ${d.tier}]`
+        if (d.mode) detail += ` ${d.mode}`
+        if (d.current_price) detail += ` ₹${d.current_price}`
+        if (d.change_pct != null) detail += ` (${d.change_pct > 0 ? '+' : ''}${(+d.change_pct).toFixed(2)}%)`
+        if (d.article_count != null) detail += ` • ${d.article_count} articles`
+        if (d.grounding_summary) detail += ` — ${String(d.grounding_summary).slice(0, 80)}`
+        const call = { tool: msg.tool, detail: detail.trim(), data: d, timestamp: Date.now() }
         setMcpToolCalls(prev => [...prev, call])
         setMcpTool(msg.tool)
         break
@@ -164,6 +194,31 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
     }
   }, [lastMessage])
 
+  // ── Typewriter effect: drip typewriterTarget.text into transcripts ──
+  useEffect(() => {
+    if (!typewriterTarget) return
+    if (typewriterRef.current) {
+      clearInterval(typewriterRef.current)
+      typewriterRef.current = null
+    }
+    const { speaker, text } = typewriterTarget
+    typewriterIdx.current = 0
+    const CHUNK = 4 // chars per tick — feels fast but not instant
+    typewriterRef.current = setInterval(() => {
+      const idx = typewriterIdx.current
+      if (idx >= text.length) {
+        clearInterval(typewriterRef.current)
+        typewriterRef.current = null
+        setIsStreaming(false)
+        return
+      }
+      const next = idx + CHUNK
+      setTranscripts(prev => ({ ...prev, [speaker]: text.slice(0, next) }))
+      typewriterIdx.current = next
+    }, 18) // ~220 chars/sec
+    return () => { if (typewriterRef.current) clearInterval(typewriterRef.current) }
+  }, [typewriterTarget])
+
   // Auto-scroll transcript and MCP panels
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight
@@ -200,7 +255,7 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
           >
             <span>🚨</span>
             <span style={{ fontSize: '0.85rem', fontWeight: 600 }}>{errorMsg}</span>
-            <button onClick={() => setErrorMsg(null)} style={{ background:'none', border:'none', color:'#fff', marginLeft:'auto', cursor:'pointer' }}>✕</button>
+            <button onClick={() => setErrorMsg(null)} style={{ background: 'none', border: 'none', color: '#fff', marginLeft: 'auto', cursor: 'pointer' }}>✕</button>
           </motion.div>
         )}
       </AnimatePresence>
@@ -228,7 +283,7 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
               style={{ display: 'inline-block', width: 7, height: 7, borderRadius: '50%', background: '#22d3ee' }}
             />
           )}
-          {debatePhase === 'idle'     && '◎ Awaiting debate trigger'}
+          {debatePhase === 'idle' && '◎ Awaiting debate trigger'}
           {debatePhase === 'debating' && 'Live Debate — Agentic Trading Floor'}
           {debatePhase === 'complete' && '✓ Debate Complete — Signal Generated'}
         </div>
@@ -240,7 +295,7 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
             border: `1px solid ${debateMode === 'LIVE' ? 'rgba(16,185,129,0.3)' : 'rgba(99,102,241,0.3)'}`,
             color: debateMode === 'LIVE' ? '#10b981' : '#818cf8',
           }}>
-            {debateMode === 'LIVE' ? '⚡ LIVE AI' : '◎ MOCK'}
+            {debateMode === 'LIVE' ? '⚡ LIVE AI' : '◎ SHOWDOWN'}
           </span>
         )}
 
@@ -345,11 +400,13 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
 
           {/* Auto-Scrolling MCP tool calls feed underneath agents */}
           <div style={{ marginTop: 20, width: '100%', maxWidth: 320 }}>
-            <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 700,
-              letterSpacing: '0.08em', marginBottom: 8, paddingLeft: 4 }}>
+            <div style={{
+              fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 700,
+              letterSpacing: '0.08em', marginBottom: 8, paddingLeft: 4
+            }}>
               🔌 REAL-TIME MCP TERMINAL
             </div>
-            <div 
+            <div
               ref={mcpRef}
               style={{
                 height: 140, overflowY: 'auto', paddingRight: 6,
@@ -370,20 +427,21 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
                   }}
                 >
                   <span style={{ fontSize: '0.75rem', marginTop: 2 }}>⚡</span>
-                  <div style={{ flex: 1 }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{
                       fontFamily: 'JetBrains Mono, monospace',
                       fontSize: '0.7rem', color: '#818cf8', fontWeight: 600
                     }}>
                       {call.tool}()
                     </div>
-                    {call.data && (
-                       <div style={{
-                         fontSize: '0.62rem', color: 'var(--text-muted)', 
-                         marginTop: 4, maxHeight: '3rem', overflow: 'hidden'
-                       }}>
-                         Data fetched & injected to contextual memory.
-                       </div>
+                    {call.detail && (
+                      <div style={{
+                        fontSize: '0.6rem', color: 'var(--text-muted)',
+                        marginTop: 3, lineHeight: 1.4,
+                        wordBreak: 'break-word', maxHeight: '3.6rem', overflow: 'hidden',
+                      }}>
+                        {call.detail}
+                      </div>
                     )}
                   </div>
                 </motion.div>
@@ -398,9 +456,9 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
         </div>
 
         {/* ── RIGHT: Speech bubble + transcript window ── */}
-        <div style={{ 
-          display: 'flex', flexDirection: 'column', gap: 16, 
-          height: '100%', maxHeight: 540, 
+        <div style={{
+          display: 'flex', flexDirection: 'column', gap: 16,
+          height: '100%', maxHeight: 540,
           background: 'rgba(255,255,255,0.015)',
           border: '1px solid rgba(255,255,255,0.05)',
           borderRadius: 16,
@@ -415,7 +473,7 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
             hallucinated={isHallucinatedSpeaker}
           />
 
-          {/* Scrollable full transcript history */}
+          {/* Scrollable full transcript history — chronological feed of all turns */}
           <div
             ref={scrollRef}
             style={{
@@ -424,20 +482,26 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
               paddingRight: 8,
             }}
           >
-            {PERSONAS.filter(p => p !== currentSpeaker && transcripts[p]).map(persona => (
-              <div key={persona} style={{
-                background: 'rgba(255,255,255,0.02)',
-                border: '1px solid rgba(255,255,255,0.05)',
-                borderRadius: 12, padding: '14px 18px',
-              }}>
-                <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)', marginBottom: 8, fontWeight: 700, letterSpacing: '0.05em' }}>
-                  {persona.toUpperCase()} PREVIOUS TURN
+            {chatHistory.map((chat, idx) => {
+              // Hide the very last message in the history ONLY if it belongs to the current speaker.
+              // This is because the SpeechBubble above is already displaying it!
+              if (idx === chatHistory.length - 1 && chat.speaker === currentSpeaker) return null;
+
+              return (
+                <div key={chat.id} style={{
+                  background: 'rgba(255,255,255,0.02)',
+                  border: '1px solid rgba(255,255,255,0.05)',
+                  borderRadius: 12, padding: '14px 18px',
+                }}>
+                  <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)', marginBottom: 8, fontWeight: 700, letterSpacing: '0.05em' }}>
+                    {chat.speaker.toUpperCase()}
+                  </div>
+                  <div className="markdown-wrapper" style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                    <ReactMarkdown>{chat.content}</ReactMarkdown>
+                  </div>
                 </div>
-                <div className="markdown-wrapper" style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-                  <ReactMarkdown>{transcripts[persona]}</ReactMarkdown>
-                </div>
-              </div>
-            ))}
+              )
+            })}
           </div>
         </div>
       </div>
