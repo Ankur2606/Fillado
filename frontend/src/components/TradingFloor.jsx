@@ -1,10 +1,11 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
-import { motion, AnimatePresence, useAnimation } from 'framer-motion'
+import { useState, useEffect, useRef } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
 import AgentNode from './AgentNode'
 import SpeechBubble from './SpeechBubble'
 import HallucinationBadge from './HallucinationBadge'
 import GraphViz from './GraphViz'
 import TradingSignal from './TradingSignal'
+import StockChart from './StockChart'
 import ReactMarkdown from 'react-markdown'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -53,6 +54,8 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
   const [mcpToolCalls, setMcpToolCalls] = useState([])
   const [rotationDeg, setRotationDeg] = useState(0)
   const [errorMsg, setErrorMsg] = useState(null)
+  const [stockCharts, setStockCharts] = useState({})  // ticker → { data, currentPrice, changePct, mode }
+  const [debateMode, setDebateMode] = useState('MOCK') // MOCK | LIVE
 
   const badgeTimer = useRef(null)
   const scrollRef = useRef(null)
@@ -72,7 +75,9 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
         setCausalChain([])
         setHallucinationEvents([])
         setMcpToolCalls([])
+        setStockCharts({})
         setErrorMsg(null)
+        if (msg.mode) setDebateMode(msg.mode)
         break
 
       case 'speaker_change': {
@@ -113,6 +118,17 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
         break
       }
 
+      case 'stock_chart': {
+        const { ticker, data, current_price, change_pct, mode: chartMode } = msg
+        if (ticker && data) {
+          setStockCharts(prev => ({
+            ...prev,
+            [ticker]: { data, currentPrice: current_price, changePct: change_pct, mode: chartMode },
+          }))
+        }
+        break
+      }
+
       case 'synthesis_complete':
         setFinalSignal(msg.signal || {})
         if (msg.causal_chain) setCausalChain(msg.causal_chain)
@@ -120,15 +136,17 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
         setDebatePhase('complete')
 
         // Automatically save to debate history
-        const savedDebates = JSON.parse(localStorage.getItem('fillado_debates') || '[]')
-        const newEntry = {
-          id: Date.now(),
-          event: msg.signal?.event || 'Archived Debate',
-          signal: msg.signal,
-          causal_chain: msg.causal_chain,
-          timestamp: new Date().toISOString()
+        {
+          const savedDebates = JSON.parse(localStorage.getItem('fillado_debates') || '[]')
+          const newEntry = {
+            id: Date.now(),
+            event: msg.signal?.event || 'Archived Debate',
+            signal: msg.signal,
+            causal_chain: msg.causal_chain,
+            timestamp: new Date().toISOString()
+          }
+          localStorage.setItem('fillado_debates', JSON.stringify([newEntry, ...savedDebates]))
         }
-        localStorage.setItem('fillado_debates', JSON.stringify([newEntry, ...savedDebates]))
         break
 
       case 'debate_end':
@@ -214,6 +232,17 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
           {debatePhase === 'debating' && 'Live Debate — Agentic Trading Floor'}
           {debatePhase === 'complete' && '✓ Debate Complete — Signal Generated'}
         </div>
+        {debatePhase !== 'idle' && (
+          <span style={{
+            fontSize: '0.6rem', fontWeight: 700, letterSpacing: '0.08em',
+            padding: '2px 8px', borderRadius: 5,
+            background: debateMode === 'LIVE' ? 'rgba(16,185,129,0.12)' : 'rgba(99,102,241,0.12)',
+            border: `1px solid ${debateMode === 'LIVE' ? 'rgba(16,185,129,0.3)' : 'rgba(99,102,241,0.3)'}`,
+            color: debateMode === 'LIVE' ? '#10b981' : '#818cf8',
+          }}>
+            {debateMode === 'LIVE' ? '⚡ LIVE AI' : '◎ MOCK'}
+          </span>
+        )}
 
         {hallucinationEvents.length > 0 && (
           <motion.div
@@ -436,6 +465,31 @@ export default function TradingFloor({ messages, lastMessage, wsStatus }) {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* ── Live Stock Charts (broadcast by Synthesis Agent) ── */}
+      {Object.keys(stockCharts).length > 0 && (
+        <div style={{ marginTop: 24 }}>
+          <div style={{
+            fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 700,
+            letterSpacing: '0.08em', marginBottom: 12,
+          }}>
+            📈 LIVE MARKET DATA — SYNTHESIS AGENT INTELLIGENCE
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: 16 }}>
+            {Object.entries(stockCharts).map(([ticker, chartInfo], idx) => (
+              <StockChart
+                key={ticker}
+                ticker={ticker}
+                data={chartInfo.data}
+                currentPrice={chartInfo.currentPrice}
+                changePct={chartInfo.changePct}
+                mode={chartInfo.mode}
+                colorIdx={idx}
+              />
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* ── Final signal ── */}
       <TradingSignal signal={finalSignal} causalChain={causalChain} />

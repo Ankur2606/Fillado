@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     # Groq
     groq_api_key: str = ""
 
+    # NewsData.io (Tier 1 news fetcher)
+    newsdata_api_key: str = ""
+
     # Neo4j AuraDB
     neo4j_uri: str = ""
     neo4j_username: str = "neo4j"

@@ -1,19 +1,26 @@
 """
 backend/agents/trading_floor.py
 
-LangGraph multi-agent debate:
-  - retail_trader  (Groq llama-3.3-70b-versatile) — bullish retail sentiment
-  - whale_trader   (Groq llama-3.3-70b-versatile + execute_graphrag_query tool)
-  - contrarian     (Groq llama-3.3-70b-versatile + execute_graphrag_query tool)
-  - synthesis      (Groq llama-3.3-70b-versatile, summarises + writes causal link)
+Hybrid Execution Engine — Hierarchical Agent Swarm
 
-State keys: messages, topic, current_speaker, turn_count, graph_context,
-            hallucination_detected, mcp_tool_called, final_signal, causal_chain
+Debate participants:
+  • retail     (llama-3.1-8b-instant on mock / openai/gpt-oss-120b on live)
+  • whale      (openai/gpt-oss-120b + function-calling on live)
+  • contrarian (openai/gpt-oss-120b + function-calling on live)
+  • synthesis  (openai/gpt-oss-120b — orchestrates final signal, calls yfinance + Neo4j)
+
+Mock path  → _run_agent_turn       (fast deterministic stream, no LLM tool-calls)
+Live path  → _run_agent_turn_live  (manual 2-call function-calling loop)
+
+MOCK_EVENTS: events that use the mock path by default (safe for demo)
+Any other event string uses the live agent path.
 """
+from __future__ import annotations
+
 import json
 import logging
 import asyncio
-from typing import TypedDict, Annotated, AsyncIterator
+from typing import TypedDict, Annotated, Callable, Awaitable, Any
 import operator
 
 from langgraph.graph import StateGraph, END
@@ -23,58 +30,69 @@ from backend.core.config import get_settings
 from backend.mcp_server.tools.read_tools import (
     execute_graphrag_query,
     fetch_et_news_mock,
+    fetch_et_news,
     get_nse_price_mock,
+    get_nse_price,
+    run_pattern_backtest,
+    run_pattern_backtest_mock,
 )
 from backend.mcp_server.tools.write_tools import append_causal_link
 from backend.middleware.thought_policeman import ThoughtPoliceman
 
 logger = logging.getLogger(__name__)
 
-MAX_TURNS = 3  # total debate cycles (each cycle = all 3 personas speak once)
+# ─── Model IDs ──────────────────────────────────────────────────────────────
+MODEL_LIVE_REASONING = "openai/gpt-oss-120b"   # main agents + synthesis (live path)
+MODEL_FAST_STREAM    = "llama-3.3-70b-versatile" # mock path streaming
+MODEL_MIDDLEWARE     = "llama-3.1-8b-instant"   # thought policeman / graphrag
+
+# ─── Mock event detection ────────────────────────────────────────────────────
+MOCK_EVENTS = [
+    "transport strike in gujarat",
+    "hosur factory strike",
+    "cyclone warning",
+]
+
+def _is_mock_event(topic: str) -> bool:
+    t = topic.lower().strip()
+    return any(m in t for m in MOCK_EVENTS)
+
+MAX_TURNS = 3
 
 
-# ---------------------------------------------------------------------------
-# LangGraph State
-# ---------------------------------------------------------------------------
+# ─── LangGraph State ─────────────────────────────────────────────────────────
 
 class DebateState(TypedDict):
-    messages: Annotated[list[dict], operator.add]   # accumulated transcript
-    topic: str                                        # original vernacular event
-    current_speaker: str                              # retail | whale | contrarian | synthesis
-    turn_count: int                                   # incremented each FULL cycle
-    graph_context: dict                               # GraphRAG result
+    messages:             Annotated[list[dict], operator.add]
+    topic:                str
+    current_speaker:      str
+    turn_count:           int
+    graph_context:        dict
     hallucination_detected: bool
-    mcp_tool_called: str                              # which MCP tool was invoked
-    final_signal: dict                                # trading alert from synthesis
-    causal_chain: list[dict]                          # causal links discovered
+    mcp_tool_called:      str
+    final_signal:         dict
+    causal_chain:         list[dict]
+    stock_charts:         dict   # ticker → ohlcv list
 
 
-# ---------------------------------------------------------------------------
-# Groq client factory
-# ---------------------------------------------------------------------------
+# ─── Groq client factory ─────────────────────────────────────────────────────
 
 def _groq_client() -> AsyncGroq:
     return AsyncGroq(api_key=get_settings().groq_api_key)
 
 
-# ---------------------------------------------------------------------------
-# Helper: Groq streaming wrapper (collects full text and yields chunks)
-# ---------------------------------------------------------------------------
+# ─── Streaming helpers ───────────────────────────────────────────────────────
 
-async def _stream_groq(
-    system: str,
-    user: str,
-    model: str = "llama-3.3-70b-versatile",
-    max_tokens: int = 512,
-) -> AsyncIterator[str]:
-    """Yields text chunks from Groq streaming."""
+async def _stream_groq(system: str, user: str, model: str = MODEL_FAST_STREAM,
+                       max_tokens: int = 512):
+    """Yields text chunks from Groq streaming. Used on the mock path."""
     client = _groq_client()
     try:
         stream = await client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system},
-                {"role": "user", "content": user},
+                {"role": "user",   "content": user},
             ],
             temperature=0.75,
             max_tokens=max_tokens,
@@ -85,57 +103,32 @@ async def _stream_groq(
             if delta:
                 yield delta
     except Exception as e:
-        logger.error(f"[_stream_groq] API Error: {str(e)}")
-        yield f"\n[System Error: LLM API connection failed - {str(e)}]"
+        logger.error(f"[_stream_groq] {e}")
+        yield f"\n[System Error: LLM stream failed — {e}]"
 
 
-async def _collect_groq(system: str, user: str, model: str = "llama-3.3-70b-versatile") -> str:
-    """Collects full response (non-streaming)."""
+async def _collect_groq(system: str, user: str,
+                         model: str = MODEL_LIVE_REASONING,
+                         max_tokens: int = 1024,
+                         reasoning_effort: str | None = None) -> str:
+    """Collects a full (non-streaming) response from Groq."""
     client = _groq_client()
-    response = await client.chat.completions.create(
+    kwargs: dict[str, Any] = dict(
         model=model,
         messages=[
             {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "user",   "content": user},
         ],
-        temperature=0.75,
-        max_tokens=512,
+        temperature=0.7,
+        max_tokens=max_tokens,
     )
+    if reasoning_effort:
+        kwargs["reasoning_effort"] = reasoning_effort
+    response = await client.chat.completions.create(**kwargs)
     return response.choices[0].message.content.strip()
 
 
-# ---------------------------------------------------------------------------
-# Persona system prompts
-# ---------------------------------------------------------------------------
-
-RETAIL_SYSTEM = """You are "Ravi" – an enthusiastic retail trader on Zerodha.
-You believe any local disruption is a massive opportunity. You talk about momentum, delivery volumes, and social media sentiment.
-Keep replies to 3-4 punchy sentences. Always mention at least one NSE ticker."""
-
-WHALE_SYSTEM = """You are "The Whale" – an institutional fund manager handling ₹5,000 Cr.
-You rely on supply-chain data, sector rotation models, and macro positioning. You always cite quantitative data from the graph.
-Keep replies to 3-4 analytical sentences. Name the sector impact and specific tickers."""
-
-CONTRARIAN_SYSTEM = """You are "Vikram" – a contrarian trader who profits from reversals.
-You challenge consensus, look for the opposite trade, and highlight structural headwinds the others miss.
-Keep replies to 3-4 contrarian sentences. Disagree with the last speaker and justify it with data."""
-
-SYNTHESIS_SYSTEM = """You are the "Synthesis Agent" – you read the full debate and surface a final, objective trading signal.
-Produce:
-1. CONSENSUS: (BULLISH / BEARISH / NEUTRAL) with confidence %
-2. PRIMARY_TICKER: top NSE ticker to watch
-3. SECONDARY_TICKERS: up to 3 others
-4. TIME_HORIZON: (intraday / swing / positional)
-5. CAUSAL_CHAIN: one newly discovered market connection (source ➜ relationship ➜ target)
-6. RATIONALE: 2-sentence summary
-
-Format your output as valid JSON only. No markdown."""
-
-
-# ---------------------------------------------------------------------------
-# In-memory broadcast queue (populated by the graph runner)
-# The main WebSocket handler reads from this queue.
-# ---------------------------------------------------------------------------
+# ─── In-memory broadcast queues ──────────────────────────────────────────────
 
 _active_queues: list[asyncio.Queue] = []
 
@@ -145,13 +138,11 @@ def register_queue(q: asyncio.Queue):
 
 
 def unregister_queue(q: asyncio.Queue):
-    _active_queues.discard(q) if hasattr(_active_queues, 'discard') else None
     if q in _active_queues:
         _active_queues.remove(q)
 
 
 async def _broadcast(message: dict):
-    """Push a WebSocket message to all connected clients."""
     for q in list(_active_queues):
         try:
             q.put_nowait(message)
@@ -159,9 +150,187 @@ async def _broadcast(message: dict):
             pass
 
 
-# ---------------------------------------------------------------------------
-# Agent node builders
-# ---------------------------------------------------------------------------
+# ─── Persona system prompts ──────────────────────────────────────────────────
+
+RETAIL_SYSTEM = """You are "Ravi" – an enthusiastic retail trader on Zerodha.
+You believe any local disruption is a massive opportunity. You talk about momentum,
+delivery volumes, and social media sentiment. Keep replies to 3-4 punchy sentences.
+Always mention at least one NSE ticker symbol."""
+
+WHALE_SYSTEM = """You are "The Whale" – an institutional fund manager handling ₹5,000 Cr.
+You rely on supply-chain data, sector rotation models, and macro positioning.
+You always cite quantitative data from the graph. Keep replies to 3-4 analytical sentences.
+Name the sector impact and specific ticker symbols."""
+
+CONTRARIAN_SYSTEM = """You are "Vikram" – a contrarian trader who profits from reversals.
+You challenge consensus, look for the opposite trade, and highlight structural headwinds.
+Keep replies to 3-4 contrarian sentences. Disagree with the last speaker and justify with data."""
+
+SYNTHESIS_SYSTEM = """You are the "Synthesis Agent" — you read the full debate and surface a
+final objective trading signal. Produce ONLY valid JSON (no markdown) with these keys:
+  CONSENSUS: BULLISH | BEARISH | NEUTRAL
+  CONFIDENCE_PCT: integer 0-100
+  PRIMARY_TICKER: top NSE ticker
+  SECONDARY_TICKERS: list of up to 3 NSE tickers
+  TIME_HORIZON: intraday | swing | positional
+  CAUSAL_CHAIN: "Source ➜ Relationship ➜ Target"
+  RATIONALE: 2-sentence summary
+"""
+
+
+# ─── Tool JSON schemas for openai/gpt-oss-120b function-calling ─────────────
+
+RETAIL_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_nse_price_mock",
+            "description": "Get current NSE stock price and 30-day OHLCV chart data (mock).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticker": {"type": "string", "description": "NSE ticker symbol, e.g. ADANIPORTS"}
+                },
+                "required": ["ticker"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_et_news_mock",
+            "description": "Search Economic Times for recent news about a market topic.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Market event or ticker to search for"},
+                    "timeframe": {"type": "string", "description": "Lookback window, e.g. 7d", "default": "7d"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
+
+WHALE_CONTRARIAN_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_nse_price",
+            "description": "Fetch LIVE NSE/BSE stock OHLCV data from Yahoo Finance (yfinance).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticker": {"type": "string", "description": "NSE ticker, e.g. ADANIPORTS"}
+                },
+                "required": ["ticker"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_et_news",
+            "description": (
+                "Fetch LIVE Economic Times news via a triple-tier fallback pipeline: "
+                "(1) NewsData.io REST API targeting economictimes.indiatimes.com, "
+                "(2) groq/compound autonomous web-browsing sub-agent, "
+                "(3) deterministic mock data. "
+                "CRITICAL QUERY FORMAT: Pass CONCISE keyword phrases (2-4 words max), "
+                "NOT full sentences. Good: 'Ashok Leyland strike', 'ADANIPORTS port delay', "
+                "'SEBI margin rules'. Bad: 'What is happening with Ashok Leyland factory strike today?'. "
+                "Short keyword queries maximise NewsData.io API search hits."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query":    {"type": "string", "description": "Concise 2-4 word keyword query, e.g. 'ADANIPORTS port disruption'"},
+                    "timeframe": {"type": "string", "default": "7d", "description": "Lookback window e.g. 7d, 3d"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_pattern_backtest",
+            "description": "Run historical pattern backtest for a chart pattern on an NSE ticker.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "e.g. bull flag, head and shoulders"},
+                    "ticker":  {"type": "string"},
+                },
+                "required": ["pattern", "ticker"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_graphrag_query",
+            "description": (
+                "Query the Neo4j AuraDB supply-chain knowledge graph. Returns a LOCALIZED "
+                "sub-graph (1st + 2nd degree) relevant to the query. Do NOT use to dump full DB."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "unstructured_query": {"type": "string"}
+                },
+                "required": ["unstructured_query"],
+            },
+        },
+    },
+]
+
+SYNTHESIS_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_nse_price",
+            "description": "Fetch live OHLCV chart data for an NSE ticker (for broadcasting stock charts to UI).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticker": {"type": "string"}
+                },
+                "required": ["ticker"],
+            },
+        },
+    },
+    # NOTE: append_causal_link is intentionally NOT exposed via tool schema to other agents.
+    # The Synthesis node calls it directly in code after parsing the signal JSON.
+]
+
+
+# ─── Local tool dispatch table ────────────────────────────────────────────────
+
+async def _dispatch_tool(tool_name: str, tool_args: dict) -> Any:
+    """Execute a tool locally and return its result dict."""
+    dispatch = {
+        # Mock read tools (retail path)
+        "get_nse_price_mock":      lambda a: get_nse_price_mock(**a),
+        "fetch_et_news_mock":      lambda a: fetch_et_news_mock(**a),
+        # Live read tools (whale/contrarian path)
+        "get_nse_price":           lambda a: get_nse_price(**a),
+        "fetch_et_news":           lambda a: fetch_et_news(**a),
+        "run_pattern_backtest":    lambda a: run_pattern_backtest(**a),
+        "execute_graphrag_query":  lambda a: execute_graphrag_query(**a),
+    }
+    handler = dispatch.get(tool_name)
+    if not handler:
+        return {"error": f"Unknown tool: {tool_name}"}
+    result = handler(tool_args)
+    if asyncio.iscoroutine(result):
+        return await result
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MOCK PATH — Fast streaming turn (existing logic, kept intact)
+# ═══════════════════════════════════════════════════════════════════════════
 
 async def _run_agent_turn(
     state: DebateState,
@@ -170,65 +339,49 @@ async def _run_agent_turn(
     system_prompt: str,
     use_graph_tool: bool = False,
 ) -> DebateState:
-    """Generic agent turn runner with streaming + Thought Policeman."""
-    logger.info(f"========== 🎙 STARTING TURN: {persona_name} ==========")
-    print(f"\n[LANGGRAPH] Executing Node for Persona: {persona_name}")
+    """Mock-path agent turn — streams from llama-3.3-70b-versatile."""
+    logger.info(f"[MOCK] 🎙 STARTING TURN: {persona_name}")
+    print(f"\n[LANGGRAPH MOCK] Node: {persona_name}")
 
     topic = state["topic"]
-    history = "\n".join(
-        f"[{m['speaker']}]: {m['content']}" for m in state["messages"][-6:]
-    )
+    history = "\n".join(f"[{m['speaker']}]: {m['content']}" for m in state["messages"][-6:])
     graph_ctx = json.dumps(state.get("graph_context", {}), indent=2)[:800]
 
-    # Optionally fetch fresh GraphRAG context for whale/contrarian
     if use_graph_tool and not state.get("graph_context"):
-        logger.info(f"[{persona_name}] Calling MCP tool: execute_graphrag_query")
-        print(f"[{persona_name}] 🔌 Calling MCP Tool: execute_graphrag_query for topic: {topic}")
         try:
             ctx = await execute_graphrag_query(topic)
             state = {**state, "graph_context": ctx}
             await _broadcast({"type": "mcp_tool", "tool": "execute_graphrag_query", "data": ctx})
-            print(f"[{persona_name}] 🔌 GraphRAG Result -> {json.dumps(ctx)[:100]}...")
         except Exception as exc:
-            logger.warning(f"GraphRAG tool error: {exc}")
-            print(f"[{persona_name}] ❌ GraphRAG tool failed: {exc}")
+            logger.warning(f"GraphRAG mock path error: {exc}")
 
-    user_prompt = f"""Event: {topic}
+    user_prompt = (
+        f"Event: {topic}\n\nRecent Debate:\n{history}\n\n"
+        f"GraphRAG Context:\n{graph_ctx}\n\nNow give YOUR perspective as {persona_name}."
+    )
 
-Recent Debate:
-{history}
-
-GraphRAG Context:
-{graph_ctx}
-
-Now give YOUR perspective as {persona_name}."""
-
-    # --- Stream and monitor ---
     buffer = ""
     token_count = 0
     policeman = ThoughtPoliceman()
     hallucination_triggered = False
 
     await _broadcast({"type": "speaker_change", "speaker": persona_key})
-    # Pulse Check Broadcast to verify pipe is open before LLM request
     await asyncio.sleep(0.01)
-    await _broadcast({"type": "token", "speaker": persona_key, "content": " *[Groq API connecting...]* "})
+    await _broadcast({"type": "token", "speaker": persona_key, "content": " *[Connecting...]* "})
 
     async def on_hallucination():
         nonlocal hallucination_triggered
         hallucination_triggered = True
         await _broadcast({"type": "hallucination_detected", "speaker": persona_key})
-        # Force MCP tool call to ground the agent
         news = fetch_et_news_mock(query=topic)
         await _broadcast({"type": "mcp_tool", "tool": "fetch_et_news_mock", "data": news})
 
     try:
-        async for chunk in _stream_groq(system_prompt, user_prompt):
+        async for chunk in _stream_groq(system_prompt, user_prompt, model=MODEL_FAST_STREAM):
             buffer += chunk
             token_count += 1
+            print(chunk, end="", flush=True)
             await _broadcast({"type": "token", "speaker": persona_key, "content": chunk})
-
-            # Thought Policeman check
             if not hallucination_triggered:
                 await policeman.check_drift(
                     objective=topic,
@@ -237,21 +390,18 @@ Now give YOUR perspective as {persona_name}."""
                     token_count=token_count,
                 )
     except Exception as e:
-        err_msg = f" \n🛑 **LLM Deadlock/Error**: {type(e).__name__} - {str(e)}\n "
-        logger.error(f"[_run_agent_turn] {err_msg}", exc_info=True)
-        print(f"[_run_agent_turn] FATAL ERROR: {err_msg}")
-        buffer += err_msg
-        await _broadcast({"type": "token", "speaker": persona_key, "content": err_msg})
+        err = f"\n🛑 **Stream Error**: {type(e).__name__} — {e}\n"
+        logger.error(f"[_run_agent_turn] {err}", exc_info=True)
+        print(err)
+        buffer += err
+        await _broadcast({"type": "token", "speaker": persona_key, "content": err})
 
-    # If hallucination was detected, append a correction notice
     if hallucination_triggered:
         correction = "\n\n[Context corrected via MCP. Continuing with grounded data.]"
         buffer += correction
         await _broadcast({"type": "token", "speaker": persona_key, "content": correction})
 
-    print(f"\n[{persona_name} FINISHED] Generated {token_count} tokens")
-    logger.info(f"========== 🏁 END TURN: {persona_name} ==========")
-
+    print(f"\n[{persona_name} FINISHED — MOCK] {token_count} tokens")
     new_msg = {"speaker": persona_key, "content": buffer, "hallucinated": hallucination_triggered}
     return {
         **state,
@@ -262,161 +412,359 @@ Now give YOUR perspective as {persona_name}."""
     }
 
 
-# ---------------------------------------------------------------------------
-# Node functions
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# LIVE PATH — Manual 2-call function-calling loop (openai/gpt-oss-120b)
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _run_agent_turn_live(
+    state: DebateState,
+    persona_key: str,
+    persona_name: str,
+    system_prompt: str,
+    tool_schemas: list[dict],
+) -> DebateState:
+    """
+    Live-path agent turn using openai/gpt-oss-120b with manual function-calling.
+
+    Call 1 (non-streaming): Agent decides which tools to call.
+    Tool execution: Dispatch locally, broadcast mcp_tool to UI.
+    Call 2 (streaming): Agent generates final answer with tool results.
+    """
+    logger.info(f"[LIVE] 🎙 STARTING TURN: {persona_name}")
+    print(f"\n[LANGGRAPH LIVE] Node: {persona_name} → model: {MODEL_LIVE_REASONING}")
+
+    topic    = state["topic"]
+    history  = "\n".join(f"[{m['speaker']}]: {m['content']}" for m in state["messages"][-6:])
+    graph_ctx = json.dumps(state.get("graph_context", {}), indent=2)[:600]
+
+    user_content = (
+        f"Market Event: {topic}\n\n"
+        f"Recent Debate:\n{history}\n\n"
+        f"Supply-Chain Context:\n{graph_ctx}\n\n"
+        f"Use available tools to ground your analysis, then give your perspective as {persona_name}."
+    )
+
+    messages: list[dict] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_content},
+    ]
+
+    client = _groq_client()
+    await _broadcast({"type": "speaker_change", "speaker": persona_key})
+    await asyncio.sleep(0.01)
+    await _broadcast({"type": "token", "speaker": persona_key, "content": " *[Researching with live tools...]* "})
+
+    # ── Call 1: Tool Decision ────────────────────────────────────────────────
+    tool_calls_made = []
+    try:
+        print(f"[{persona_name}] Call 1 → tool decision ({MODEL_LIVE_REASONING})")
+        resp1 = await client.chat.completions.create(
+            model=MODEL_LIVE_REASONING,
+            messages=messages,
+            tools=tool_schemas,
+            tool_choice="auto",
+            max_tokens=1024,
+            reasoning_effort="medium",
+        )
+        assistant_msg = resp1.choices[0].message
+
+        # Append the assistant's (possibly tool-calling) message
+        assistant_dict = {"role": "assistant", "content": assistant_msg.content or ""}
+        if assistant_msg.tool_calls:
+            assistant_dict["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in assistant_msg.tool_calls
+            ]
+        messages.append(assistant_dict)
+
+        # ── Tool Execution ───────────────────────────────────────────────────
+        if assistant_msg.tool_calls:
+            for tc in assistant_msg.tool_calls:
+                fn_name = tc.function.name
+                try:
+                    fn_args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    fn_args = {}
+
+                print(f"[{persona_name}] 🔌 Dispatching tool: {fn_name}({fn_args})")
+                logger.info(f"[{persona_name}] Tool dispatch: {fn_name}")
+
+                try:
+                    result = await _dispatch_tool(fn_name, fn_args)
+                except Exception as exc:
+                    result = {"error": str(exc)}
+                    logger.error(f"[{persona_name}] Tool {fn_name} failed: {exc}")
+
+                await _broadcast({"type": "mcp_tool", "tool": fn_name, "data": result})
+                tool_calls_made.append(fn_name)
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps(result)[:2000],  # cap to avoid context overflow
+                })
+                print(f"[{persona_name}] ✅ {fn_name} complete.")
+
+    except Exception as exc:
+        err = f"\n🛑 **Tool-Call Error**: {type(exc).__name__} — {exc}\n"
+        logger.error(f"[_run_agent_turn_live] Call 1 failed: {exc}", exc_info=True)
+        print(err)
+        await _broadcast({"type": "token", "speaker": persona_key, "content": err})
+        # Fall through to Call 2 with original messages (no tools)
+
+    # ── Call 2: Streaming Final Answer ───────────────────────────────────────
+    buffer = ""
+    token_count = 0
+    hallucination_triggered = False
+    policeman = ThoughtPoliceman()
+
+    async def on_hallucination():
+        nonlocal hallucination_triggered
+        hallucination_triggered = True
+        await _broadcast({"type": "hallucination_detected", "speaker": persona_key})
+
+    # Append instruction for final answer
+    messages.append({
+        "role": "user",
+        "content": "Now synthesize your findings and give your final trading perspective."
+    })
+
+    try:
+        print(f"[{persona_name}] Call 2 \u2192 streaming final answer ({MODEL_LIVE_REASONING})")
+        stream = await client.chat.completions.create(
+            model=MODEL_LIVE_REASONING,
+            messages=messages,
+            # NO tools on Call 2 — forces the model to generate prose, not tool calls
+            max_tokens=600,
+            stream=True,
+            reasoning_effort="medium",
+        )
+        async for chunk in stream:
+            delta = chunk.choices[0].delta.content or ""
+            if delta:
+                buffer += delta
+                token_count += 1
+                print(delta, end="", flush=True)
+                await _broadcast({"type": "token", "speaker": persona_key, "content": delta})
+                if not hallucination_triggered:
+                    await policeman.check_drift(
+                        objective=topic,
+                        generation_buffer=buffer,
+                        on_hallucination=on_hallucination,
+                        token_count=token_count,
+                    )
+    except Exception as exc:
+        err = f"\n🛑 **Live Stream Error**: {type(exc).__name__} — {exc}\n"
+        logger.error(f"[_run_agent_turn_live] Call 2 failed: {exc}", exc_info=True)
+        print(err)
+        buffer += err
+        await _broadcast({"type": "token", "speaker": persona_key, "content": err})
+
+    print(f"\n[{persona_name} FINISHED — LIVE] {token_count} tokens, tools: {tool_calls_made}")
+
+    new_msg = {
+        "speaker": persona_key,
+        "content": buffer,
+        "hallucinated": hallucination_triggered,
+        "tools_used": tool_calls_made,
+    }
+    return {
+        **state,
+        "messages": [new_msg],
+        "current_speaker": persona_key,
+        "hallucination_detected": state.get("hallucination_detected", False) or hallucination_triggered,
+        "mcp_tool_called": ", ".join(tool_calls_made) if tool_calls_made else state.get("mcp_tool_called", ""),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Node functions — route to mock or live path
+# ═══════════════════════════════════════════════════════════════════════════
 
 async def retail_node(state: DebateState) -> DebateState:
-    return await _run_agent_turn(state, "retail", "Retail Trader", RETAIL_SYSTEM, use_graph_tool=False)
+    if _is_mock_event(state["topic"]):
+        return await _run_agent_turn(state, "retail", "Retail Trader", RETAIL_SYSTEM, use_graph_tool=False)
+    return await _run_agent_turn_live(state, "retail", "Retail Trader", RETAIL_SYSTEM, RETAIL_TOOL_SCHEMAS)
 
 
 async def whale_node(state: DebateState) -> DebateState:
-    return await _run_agent_turn(state, "whale", "Whale", WHALE_SYSTEM, use_graph_tool=True)
+    if _is_mock_event(state["topic"]):
+        return await _run_agent_turn(state, "whale", "Whale", WHALE_SYSTEM, use_graph_tool=True)
+    return await _run_agent_turn_live(state, "whale", "Whale", WHALE_SYSTEM, WHALE_CONTRARIAN_TOOL_SCHEMAS)
 
 
 async def contrarian_node(state: DebateState) -> DebateState:
-    res = await _run_agent_turn(state, "contrarian", "Contrarian", CONTRARIAN_SYSTEM, use_graph_tool=True)
+    if _is_mock_event(state["topic"]):
+        res = await _run_agent_turn(state, "contrarian", "Contrarian", CONTRARIAN_SYSTEM, use_graph_tool=True)
+    else:
+        res = await _run_agent_turn_live(state, "contrarian", "Contrarian", CONTRARIAN_SYSTEM, WHALE_CONTRARIAN_TOOL_SCHEMAS)
     res["turn_count"] = state.get("turn_count", 0) + 1
     return res
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Synthesis Node — orchestrates final signal, yfinance, Neo4j write
+# ═══════════════════════════════════════════════════════════════════════════
+
 async def synthesis_node(state: DebateState) -> DebateState:
-    """Reads the full debate and generates the final trading signal."""
-    logger.info("========== 🧠 STARTING SYNTHESIS AGENT ==========")
-    print("\n[LANGGRAPH] Executing Node: Synthesis Agent (Consensus Builder)")
+    logger.info("========== 🧠 SYNTHESIS AGENT STARTING ==========")
+    print("\n[LANGGRAPH] Synthesis Agent — model: " + MODEL_LIVE_REASONING)
     await _broadcast({"type": "speaker_change", "speaker": "synthesis"})
 
-    transcript = "\n".join(
-        f"[{m['speaker']}]: {m['content']}" for m in state["messages"]
+    transcript = "\n".join(f"[{m['speaker']}]: {m['content']}" for m in state["messages"])
+    graph_ctx  = json.dumps(state.get("graph_context", {}), indent=2)[:1200]
+
+    user_prompt = (
+        f"Event: {state['topic']}\n\nFull Debate Transcript:\n{transcript}\n\n"
+        f"GraphRAG Context:\n{graph_ctx}\n\nGenerate the final trading signal JSON."
     )
-    graph_ctx = json.dumps(state.get("graph_context", {}), indent=2)[:1200]
 
-    user_prompt = f"""Event: {state['topic']}
+    # Use openai/gpt-oss-120b with reasoning for synthesis
+    try:
+        raw = await _collect_groq(
+            SYNTHESIS_SYSTEM, user_prompt,
+            model=MODEL_LIVE_REASONING,
+            max_tokens=1024,
+            reasoning_effort="medium",
+        )
+    except Exception as exc:
+        logger.error(f"[synthesis_node] LLM failed: {exc}")
+        raw = json.dumps({
+            "CONSENSUS": "NEUTRAL", "CONFIDENCE_PCT": 50,
+            "PRIMARY_TICKER": "NIFTY50", "SECONDARY_TICKERS": [],
+            "TIME_HORIZON": "swing", "CAUSAL_CHAIN": "", "RATIONALE": str(exc),
+        })
 
-Full Debate Transcript:
-{transcript}
-
-GraphRAG Context:
-{graph_ctx}
-
-Generate the final trading signal JSON."""
-
-    raw = await _collect_groq(SYNTHESIS_SYSTEM, user_prompt)
-
-    # Stream the synthesis to frontend
+    # Stream synthesis text character-by-character
     for ch in raw:
         await _broadcast({"type": "token", "speaker": "synthesis", "content": ch})
-        await asyncio.sleep(0.005)
+        await asyncio.sleep(0.003)
 
-    # Parse signal
-    signal = {}
-    causal_chain = state.get("causal_chain", [])
+    # ── Parse signal JSON ────────────────────────────────────────────────────
+    signal: dict = {}
+    causal_chain = list(state.get("causal_chain", []))
+    stock_charts = dict(state.get("stock_charts", {}))
+
     try:
         clean = raw.replace("```json", "").replace("```", "").strip()
         signal = json.loads(clean)
-        # If synthesis found a new causal link, write it to Neo4j via MCP
-        if "CAUSAL_CHAIN" in signal:
-            link = signal["CAUSAL_CHAIN"]
-            parts = [p.strip() for p in str(link).split("➜")]
-            if len(parts) == 3:
-                logger.info(f"[Synthesis] Calling MCP tool: append_causal_link with {parts}")
-                print(f"[Synthesis] 🔌 Calling MCP Tool: append_causal_link -> {parts}")
-                result = await append_causal_link(
-                    source=parts[0], relationship=parts[1], target=parts[2]
-                )
-                await _broadcast({"type": "graph_update", "data": result})
-                causal_chain.append({"source": parts[0], "relationship": parts[1], "target": parts[2]})
-                print(f"[Synthesis] 🔌 Causal link saved successfully!")
     except Exception as exc:
-        logger.warning(f"Synthesis JSON parse error: {exc}")
+        logger.warning(f"[synthesis_node] JSON parse failed: {exc}")
         signal = {"raw": raw}
+
+    # ── Autonomously fetch yfinance data for top tickers ─────────────────────
+    tickers_to_chart: list[str] = []
+    if "PRIMARY_TICKER" in signal:
+        tickers_to_chart.append(signal["PRIMARY_TICKER"])
+    for t in signal.get("SECONDARY_TICKERS", [])[:2]:  # max 2 secondary
+        if t and t not in tickers_to_chart:
+            tickers_to_chart.append(t)
+
+    for ticker in tickers_to_chart:
+        try:
+            print(f"\n[Synthesis] 📈 Fetching stock chart for {ticker}")
+            await _broadcast({"type": "mcp_tool", "tool": "get_nse_price", "data": {"ticker": ticker, "status": "fetching..."}})
+            price_data = await get_nse_price(ticker)
+            stock_charts[ticker] = price_data.get("ohlcv", [])
+            await _broadcast({
+                "type": "stock_chart",
+                "ticker": ticker,
+                "data": price_data.get("ohlcv", []),
+                "current_price": price_data.get("current_price"),
+                "change_pct": price_data.get("change_pct"),
+                "mode": price_data.get("mode", "unknown"),
+            })
+            print(f"[Synthesis] ✅ Stock chart broadcast for {ticker}")
+        except Exception as exc:
+            logger.error(f"[synthesis_node] yfinance for {ticker} failed: {exc}")
+
+    # ── Write new causal link to Neo4j ──────────────────────────────────────
+    if "CAUSAL_CHAIN" in signal:
+        link_str = str(signal["CAUSAL_CHAIN"])
+        parts = [p.strip() for p in link_str.split("➜")]
+        if len(parts) == 3:
+            try:
+                print(f"[Synthesis] 🔗 Writing causal link: {parts}")
+                await _broadcast({"type": "mcp_tool", "tool": "append_causal_link",
+                                   "data": {"source": parts[0], "rel": parts[1], "target": parts[2]}})
+                result = await append_causal_link(source=parts[0], relationship=parts[1], target=parts[2])
+                causal_chain.append({"source": parts[0], "relationship": parts[1], "target": parts[2]})
+                await _broadcast({"type": "graph_update", "data": result})
+                print(f"[Synthesis] ✅ Neo4j write: {result.get('message', result)}")
+            except Exception as exc:
+                logger.error(f"[synthesis_node] append_causal_link failed: {exc}")
 
     await _broadcast({"type": "synthesis_complete", "signal": signal, "causal_chain": causal_chain})
 
     return {
         **state,
-        "messages": [{"speaker": "Synthesis", "content": raw}],
+        "messages": [{"speaker": "synthesis", "content": raw}],
         "current_speaker": "synthesis",
         "final_signal": signal,
         "causal_chain": causal_chain,
+        "stock_charts": stock_charts,
     }
 
 
-# ---------------------------------------------------------------------------
-# Routing logic
-# ---------------------------------------------------------------------------
-
-def route_after_retail(state: DebateState) -> str:
-    return "whale"
-
-
-def route_after_whale(state: DebateState) -> str:
-    return "contrarian"
-
+# ─── Routing ─────────────────────────────────────────────────────────────────
 
 def route_after_contrarian(state: DebateState) -> str:
     turn = state.get("turn_count", 0)
-    if turn >= MAX_TURNS:
-        return "synthesis"
-    return "retail"
+    return "synthesis" if turn >= MAX_TURNS else "retail"
 
 
-def increment_turn(state: DebateState) -> DebateState:
-    return {**state, "turn_count": state.get("turn_count", 0) + 1}
-
-
-# ---------------------------------------------------------------------------
-# Build the graph
-# ---------------------------------------------------------------------------
+# ─── Build LangGraph ─────────────────────────────────────────────────────────
 
 def build_trading_floor_graph():
-    """Builds and compiles the LangGraph StateGraph."""
     graph = StateGraph(DebateState)
-
-    graph.add_node("retail", retail_node)
-    graph.add_node("whale", whale_node)
+    graph.add_node("retail",     retail_node)
+    graph.add_node("whale",      whale_node)
     graph.add_node("contrarian", contrarian_node)
-    graph.add_node("synthesis", synthesis_node)
+    graph.add_node("synthesis",  synthesis_node)
 
     graph.set_entry_point("retail")
-
     graph.add_edge("retail", "whale")
-    graph.add_edge("whale", "contrarian")
+    graph.add_edge("whale",  "contrarian")
     graph.add_conditional_edges(
         "contrarian",
         route_after_contrarian,
         {"retail": "retail", "synthesis": "synthesis"},
     )
     graph.add_edge("synthesis", END)
-
     return graph.compile()
 
 
 trading_floor_graph = build_trading_floor_graph()
 
 
-# ---------------------------------------------------------------------------
-# Public runner
-# ---------------------------------------------------------------------------
+# ─── Public runner ────────────────────────────────────────────────────────────
 
 async def run_trading_floor(topic: str, graph_context: dict) -> DebateState:
-    """
-    Invoke the full LangGraph debate for a given vernacular event.
-    Returns the final state after synthesis.
-    """
+    """Runs the full LangGraph debate for a given vernacular event."""
+    mode = "MOCK" if _is_mock_event(topic) else "LIVE"
+    print(f"\n{'='*60}")
+    print(f"[FILLADO] Starting debate in {mode} mode for: '{topic}'")
+    print(f"[FILLADO] Main model: {MODEL_LIVE_REASONING if mode == 'LIVE' else MODEL_FAST_STREAM}")
+    print(f"{'='*60}")
+
     initial_state: DebateState = {
-        "messages": [],
-        "topic": topic,
-        "current_speaker": "retail",
-        "turn_count": 0,
-        "graph_context": graph_context,
+        "messages":              [],
+        "topic":                 topic,
+        "current_speaker":       "retail",
+        "turn_count":            0,
+        "graph_context":         graph_context,
         "hallucination_detected": False,
-        "mcp_tool_called": "",
-        "final_signal": {},
-        "causal_chain": [],
+        "mcp_tool_called":       "",
+        "final_signal":          {},
+        "causal_chain":          [],
+        "stock_charts":          {},
     }
 
-    await _broadcast({"type": "debate_start", "topic": topic})
+    await _broadcast({"type": "debate_start", "topic": topic, "mode": mode})
     final_state = await trading_floor_graph.ainvoke(initial_state)
-    await _broadcast({"type": "debate_end"})
+    await _broadcast({"type": "debate_end", "mode": mode})
     return final_state
