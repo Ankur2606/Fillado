@@ -164,6 +164,65 @@ async def get_mock_event():
     }
 
 
+@app.get("/api/graph-data", tags=["GraphRAG"])
+async def get_graph_data():
+    """
+    Returns the global knowledge graph (nodes/links).
+    Uses Neo4j if configured, otherwise falls back to the MOCK_GRAPH (which includes dynamic user additions).
+    """
+    settings = get_settings()
+    
+    # Try Neo4j first
+    if settings.neo4j_uri and "your-instance-id" not in settings.neo4j_uri:
+        try:
+            from neo4j import GraphDatabase
+            driver = GraphDatabase.driver(settings.neo4j_uri, auth=(settings.neo4j_username, settings.neo4j_password))
+            cypher = "MATCH (n)-[r]->(m) RETURN n.name AS source, type(r) AS rel, m.name AS target, labels(n) AS src_labels, labels(m) AS tgt_labels LIMIT 150"
+            with driver.session() as session:
+                records = session.run(cypher).data()
+            driver.close()
+            
+            if records:
+                nodes = {}
+                links = []
+                for r in records:
+                    s, t = r["source"], r["target"]
+                    nodes[s] = {"id": s, "group": 1 if "Ticker" in r.get("src_labels", []) else 2}
+                    nodes[t] = {"id": t, "group": 1 if "Ticker" in r.get("tgt_labels", []) else 2}
+                    links.append({"source": s, "target": t, "label": r["rel"]})
+                return {"nodes": list(nodes.values()), "links": links}
+        except Exception as e:
+            logger.error(f"Neo4j global graph fetch failed: {e}")
+
+    # Fallback to the rich, in-memory mock graph (which persists append_causal_link updates)
+    from backend.graph.graphrag import MOCK_GRAPH
+    
+    nodes_map = {}
+    
+    # Base event node
+    if "event" in MOCK_GRAPH:
+        ev = MOCK_GRAPH["event"]
+        nodes_map[ev] = {"id": ev, "group": 3, "val": 30}
+        
+    for e in MOCK_GRAPH.get("entities", []):
+        if e not in nodes_map: nodes_map[e] = {"id": e, "group": 2, "val": 20}
+        
+    for t in MOCK_GRAPH.get("affected_tickers", []):
+        if t not in nodes_map: nodes_map[t] = {"id": t, "group": 1, "val": 25}
+
+    links = []
+    for c in MOCK_GRAPH.get("causal_chain", []):
+        s, t = c["source"], c["target"]
+        if s not in nodes_map: nodes_map[s] = {"id": s, "group": 2, "val": 15}
+        if t not in nodes_map: nodes_map[t] = {"id": t, "group": 1, "val": 15}
+        links.append({
+            "source": s,
+            "target": t,
+            "label": c["relationship"]
+        })
+        
+    return {"nodes": list(nodes_map.values()), "links": links}
+
 # ---------------------------------------------------------------------------
 # WebSocket
 # ---------------------------------------------------------------------------

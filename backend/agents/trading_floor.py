@@ -87,31 +87,41 @@ async def _stream_groq(system: str, user: str, model: str = MODEL_FAST_STREAM,
                        max_tokens: int = 512):
     """Yields text chunks from Groq streaming. Used on the mock path."""
     client = _groq_client()
-    try:
-        stream = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user},
-            ],
-            temperature=0.75,
-            max_tokens=max_tokens,
-            stream=True,
-        )
-        async for chunk in stream:
-            delta = chunk.choices[0].delta.content or ""
-            if delta:
-                yield delta
-    except Exception as e:
-        logger.error(f"[_stream_groq] {e}")
-        yield f"\n[System Error: LLM stream failed — {e}]"
+    for attempt in range(3):
+        try:
+            stream = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user},
+                ],
+                temperature=0.75,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content or ""
+                if delta:
+                    yield delta
+            return  # success — exit retry loop
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str and attempt < 2:
+                wait = (attempt + 1) * 8
+                logger.warning(f"[_stream_groq] 429 rate-limit, retrying in {wait}s...")
+                print(f"\n[Groq] ⚡ Rate-limited, cooling down {wait}s...")
+                await asyncio.sleep(wait)
+            else:
+                logger.error(f"[_stream_groq] failed: {e}")
+                yield f"\n[System Error: LLM stream failed — {e}]"
+                return
 
 
 async def _collect_groq(system: str, user: str,
                          model: str = MODEL_LIVE_REASONING,
                          max_tokens: int = 1024,
                          reasoning_effort: str | None = None) -> str:
-    """Collects a full (non-streaming) response from Groq."""
+    """Collects a full (non-streaming) response from Groq with 429 retry."""
     client = _groq_client()
     kwargs: dict[str, Any] = dict(
         model=model,
@@ -124,8 +134,18 @@ async def _collect_groq(system: str, user: str,
     )
     if reasoning_effort:
         kwargs["reasoning_effort"] = reasoning_effort
-    response = await client.chat.completions.create(**kwargs)
-    return response.choices[0].message.content.strip()
+    for attempt in range(3):
+        try:
+            response = await client.chat.completions.create(**kwargs)
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            if "429" in str(e) and attempt < 2:
+                wait = (attempt + 1) * 10
+                logger.warning(f"[_collect_groq] 429 rate-limit, retrying in {wait}s...")
+                print(f"\n[Groq] ⚡ Rate-limited, cooling down {wait}s...")
+                await asyncio.sleep(wait)
+            else:
+                raise
 
 
 # ─── In-memory broadcast queues ──────────────────────────────────────────────
@@ -184,7 +204,7 @@ RETAIL_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "get_nse_price_mock",
+            "name": "get_nse_price",
             "description": "Get current NSE stock price and 30-day OHLCV chart data (mock).",
             "parameters": {
                 "type": "object",
@@ -198,7 +218,7 @@ RETAIL_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "fetch_et_news_mock",
+            "name": "fetch_et_news",
             "description": "Search Economic Times for recent news about a market topic.",
             "parameters": {
                 "type": "object",
@@ -366,8 +386,7 @@ async def _run_agent_turn(
     hallucination_triggered = False
 
     await _broadcast({"type": "speaker_change", "speaker": persona_key})
-    await asyncio.sleep(0.01)
-    await _broadcast({"type": "token", "speaker": persona_key, "content": " *[Connecting...]* "})
+    await asyncio.sleep(0.05)
 
     async def on_hallucination():
         nonlocal hallucination_triggered
@@ -377,11 +396,11 @@ async def _run_agent_turn(
         await _broadcast({"type": "mcp_tool", "tool": "fetch_et_news_mock", "data": news})
 
     try:
+        # ── Collect full response internally (no per-token WS broadcast) ──
         async for chunk in _stream_groq(system_prompt, user_prompt, model=MODEL_FAST_STREAM):
             buffer += chunk
             token_count += 1
-            print(chunk, end="", flush=True)
-            await _broadcast({"type": "token", "speaker": persona_key, "content": chunk})
+            print(chunk, end="", flush=True)  # still stream to console
             if not hallucination_triggered:
                 await policeman.check_drift(
                     objective=topic,
@@ -394,14 +413,14 @@ async def _run_agent_turn(
         logger.error(f"[_run_agent_turn] {err}", exc_info=True)
         print(err)
         buffer += err
-        await _broadcast({"type": "token", "speaker": persona_key, "content": err})
 
     if hallucination_triggered:
-        correction = "\n\n[Context corrected via MCP. Continuing with grounded data.]"
-        buffer += correction
-        await _broadcast({"type": "token", "speaker": persona_key, "content": correction})
+        buffer += "\n\n*[Context corrected via MCP. Continuing with grounded data.]*"
 
     print(f"\n[{persona_name} FINISHED — MOCK] {token_count} tokens")
+    # ── Broadcast ONE complete agent_response (frontend fake-streams this) ──
+    await _broadcast({"type": "agent_response", "speaker": persona_key, "content": buffer})
+
     new_msg = {"speaker": persona_key, "content": buffer, "hallucinated": hallucination_triggered}
     return {
         **state,
@@ -510,13 +529,12 @@ async def _run_agent_turn_live(
                 print(f"[{persona_name}] ✅ {fn_name} complete.")
 
     except Exception as exc:
-        err = f"\n🛑 **Tool-Call Error**: {type(exc).__name__} — {exc}\n"
+        err_str = str(exc)
         logger.error(f"[_run_agent_turn_live] Call 1 failed: {exc}", exc_info=True)
-        print(err)
-        await _broadcast({"type": "token", "speaker": persona_key, "content": err})
+        print(f"\n[{persona_name}] ⚠️ Call 1 error: {exc}")
         # Fall through to Call 2 with original messages (no tools)
 
-    # ── Call 2: Streaming Final Answer ───────────────────────────────────────
+    # ── Call 2: Collect Full Final Answer (buffered, NOT per-token broadcast) ──
     buffer = ""
     token_count = 0
     hallucination_triggered = False
@@ -527,44 +545,56 @@ async def _run_agent_turn_live(
         hallucination_triggered = True
         await _broadcast({"type": "hallucination_detected", "speaker": persona_key})
 
-    # Append instruction for final answer
+    # Inject forceful no-tool instruction as system override
     messages.append({
         "role": "user",
-        "content": "Now synthesize your findings and give your final trading perspective."
+        "content": (
+            "Based on your research above, give your final trading perspective as "
+            f"{persona_name}. Output ONLY plain text prose — absolutely no function "
+            "calls or tool use of any kind."
+        )
     })
 
-    try:
-        print(f"[{persona_name}] Call 2 \u2192 streaming final answer ({MODEL_LIVE_REASONING})")
-        stream = await client.chat.completions.create(
-            model=MODEL_LIVE_REASONING,
-            messages=messages,
-            # NO tools on Call 2 — forces the model to generate prose, not tool calls
-            max_tokens=600,
-            stream=True,
-            reasoning_effort="medium",
-        )
-        async for chunk in stream:
-            delta = chunk.choices[0].delta.content or ""
-            if delta:
-                buffer += delta
-                token_count += 1
-                print(delta, end="", flush=True)
-                await _broadcast({"type": "token", "speaker": persona_key, "content": delta})
-                if not hallucination_triggered:
-                    await policeman.check_drift(
-                        objective=topic,
-                        generation_buffer=buffer,
-                        on_hallucination=on_hallucination,
-                        token_count=token_count,
-                    )
-    except Exception as exc:
-        err = f"\n🛑 **Live Stream Error**: {type(exc).__name__} — {exc}\n"
-        logger.error(f"[_run_agent_turn_live] Call 2 failed: {exc}", exc_info=True)
-        print(err)
-        buffer += err
-        await _broadcast({"type": "token", "speaker": persona_key, "content": err})
+    for attempt in range(3):
+        buffer = ""
+        try:
+            print(f"[{persona_name}] Call 2 → final answer (attempt {attempt+1})")
+            stream = await client.chat.completions.create(
+                model=MODEL_LIVE_REASONING,
+                messages=messages,
+                # Deliberately NO tools parameter — prevents tool call entirely
+                max_tokens=600,
+                stream=True,
+                temperature=0.7,
+            )
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content or ""
+                if delta:
+                    buffer += delta
+                    token_count += 1
+                    print(delta, end="", flush=True)
+                    if not hallucination_triggered:
+                        await policeman.check_drift(
+                            objective=topic,
+                            generation_buffer=buffer,
+                            on_hallucination=on_hallucination,
+                            token_count=token_count,
+                        )
+            break  # success
+        except Exception as exc:
+            if "429" in str(exc) and attempt < 2:
+                wait = (attempt + 1) * 10
+                print(f"\n[{persona_name}] ⚡ 429 rate-limit, waiting {wait}s...")
+                await asyncio.sleep(wait)
+            else:
+                err = f"\n🛑 **Live Error**: {type(exc).__name__} — {exc}\n"
+                logger.error(f"[_run_agent_turn_live] Call 2 failed: {exc}", exc_info=True)
+                buffer += err
+                break
 
     print(f"\n[{persona_name} FINISHED — LIVE] {token_count} tokens, tools: {tool_calls_made}")
+    # ── Broadcast ONE complete agent_response (frontend fake-streams it) ──
+    await _broadcast({"type": "agent_response", "speaker": persona_key, "content": buffer})
 
     new_msg = {
         "speaker": persona_key,
@@ -639,10 +669,8 @@ async def synthesis_node(state: DebateState) -> DebateState:
             "TIME_HORIZON": "swing", "CAUSAL_CHAIN": "", "RATIONALE": str(exc),
         })
 
-    # Stream synthesis text character-by-character
-    for ch in raw:
-        await _broadcast({"type": "token", "speaker": "synthesis", "content": ch})
-        await asyncio.sleep(0.003)
+    # Broadcast complete synthesis text as one message (frontend fake-streams it)
+    await _broadcast({"type": "agent_response", "speaker": "synthesis", "content": raw})
 
     # ── Parse signal JSON ────────────────────────────────────────────────────
     signal: dict = {}

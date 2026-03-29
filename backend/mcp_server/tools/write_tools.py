@@ -1,9 +1,10 @@
 """
 backend/mcp_server/tools/write_tools.py
 MCP Write Tool – append_causal_link
-Used ONLY by the Synthesis Agent to permanently write newly discovered
-market connections back to Neo4j AuraDB.
+
+Runs Neo4j I/O in a thread executor to avoid blocking the async event loop.
 """
+import asyncio
 import logging
 import re
 
@@ -11,7 +12,6 @@ from backend.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Allowlist of valid relationship types to prevent Cypher injection
 ALLOWED_RELATIONSHIPS = {
     "CAUSES", "IMPACTS", "DISRUPTS", "DELAYS", "RIPPLES",
     "SUPPLY_CHAIN_RISK", "POSITIVELY_IMPACTS", "NEGATIVELY_IMPACTS",
@@ -20,7 +20,6 @@ ALLOWED_RELATIONSHIPS = {
 
 
 def _validate_identifier(val: str, field: str) -> str:
-    """Validate that a node name is safe to embed in Cypher."""
     if not re.match(r'^[\w\s\-\.&]+$', val):
         raise ValueError(f"Invalid characters in {field}: {val!r}")
     return val.strip()
@@ -28,16 +27,10 @@ def _validate_identifier(val: str, field: str) -> str:
 
 async def append_causal_link(source: str, relationship: str, target: str) -> dict:
     """
-    Synthesis Agent uses this to write a newly discovered market connection
-    to Neo4j AuraDB via a MERGE Cypher query.
-    MCP Tool: append_causal_link (Write)
-
-    Args:
-        source:       Source node name (e.g., "Transport Strike")
-        relationship: Edge type (must be in ALLOWED_RELATIONSHIPS)
-        target:       Target node name (e.g., "ADANIPORTS")
+    Writes a new causal market connection to Neo4j AuraDB.
+    Neo4j I/O runs in a thread executor so it doesn't block the WebSocket event loop.
     """
-    # Validate inputs
+    # ── Input validation ─────────────────────────────────────────────────────
     try:
         source = _validate_identifier(source, "source")
         target = _validate_identifier(target, "target")
@@ -49,50 +42,72 @@ async def append_causal_link(source: str, relationship: str, target: str) -> dic
         return {
             "tool": "append_causal_link",
             "success": False,
-            "error": f"Relationship '{rel_upper}' not in allowlist. Allowed: {sorted(ALLOWED_RELATIONSHIPS)}",
+            "error": f"Relationship '{rel_upper}' not in allowlist: {sorted(ALLOWED_RELATIONSHIPS)}",
         }
 
     settings = get_settings()
 
-    if not settings.neo4j_uri:
-        # Mock mode – log and return success without writing
-        logger.info(f"[MCP-MOCK] Would write: ({source})-[:{rel_upper}]->({target})")
+    # ── Mock mode (no URI configured) ─────────────────────────────────────────
+    if not settings.neo4j_uri or "your-instance-id" in settings.neo4j_uri:
+        logger.info(f"[MCP-MOCK] Write: ({source})-[:{rel_upper}]->({target})")
+        # Save to mock graph globally so the Graph Intelligence screen shows it
+        from backend.graph.graphrag import MOCK_GRAPH
+        MOCK_GRAPH["causal_chain"].append({
+            "source": source,
+            "relationship": rel_upper,
+            "target": target
+        })
+        if source not in MOCK_GRAPH["entities"]: MOCK_GRAPH["entities"].append(source)
+        if target not in MOCK_GRAPH["affected_tickers"]: MOCK_GRAPH["affected_tickers"].append(target)
+        
         return {
             "tool": "append_causal_link",
             "success": True,
             "mode": "mock",
             "message": f"Graph learning recorded (mock): ({source})-[:{rel_upper}]->({target})",
-            "source": source,
-            "relationship": rel_upper,
-            "target": target,
+            "source": source, "relationship": rel_upper, "target": target,
         }
 
-    try:
-        from neo4j import GraphDatabase
+    # ── Live Neo4j write (in thread executor) ─────────────────────────────────
+    def _sync_write():
+        from neo4j import GraphDatabase, exceptions as neo4j_exc
         driver = GraphDatabase.driver(
             settings.neo4j_uri,
             auth=(settings.neo4j_username, settings.neo4j_password),
+            max_connection_lifetime=300,
+            connection_timeout=15,
         )
         cypher = """
         MERGE (s:Entity {name: $source})
         MERGE (t:Entity {name: $target})
         MERGE (s)-[r:CAUSAL_LINK {type: $rel}]->(t)
         ON CREATE SET r.created_at = datetime(), r.source = 'fillado_synthesis'
-        ON MATCH  SET r.updated_at = datetime(), r.confirmed_count = coalesce(r.confirmed_count, 0) + 1
+        ON MATCH  SET r.updated_at = datetime(),
+                      r.confirmed_count = coalesce(r.confirmed_count, 0) + 1
         RETURN s.name AS src, type(r) AS relationship, t.name AS tgt
         """
-        with driver.session() as session:
-            record = session.run(cypher, source=source, target=target, rel=rel_upper).single()
-        driver.close()
-        return {
-            "tool": "append_causal_link",
-            "success": True,
-            "mode": "live",
-            "message": f"Neo4j updated: ({source})-[:{rel_upper}]->({target})",
-            "source": source,
-            "relationship": rel_upper,
-            "target": target,
-        }
+        try:
+            with driver.session(database="neo4j") as session:
+                record = session.run(cypher, source=source, target=target, rel=rel_upper).single()
+            driver.close()
+            return {
+                "tool": "append_causal_link",
+                "success": True,
+                "mode": "live",
+                "message": f"Neo4j updated: ({source})-[:{rel_upper}]->({target})",
+                "source": source, "relationship": rel_upper, "target": target,
+            }
+        except Exception as exc:
+            try:
+                driver.close()
+            except Exception:
+                pass
+            raise exc
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, _sync_write)
+        return result
     except Exception as exc:
         logger.error(f"[append_causal_link] Neo4j write failed: {exc}")
         return {

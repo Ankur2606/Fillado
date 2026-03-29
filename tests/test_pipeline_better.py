@@ -222,6 +222,14 @@ async def run_debate_test(event: str, log: Log, label: str, timeout_s: int = 300
                             transcripts[speaker].append(chunk)
                         log.raw(chunk, echo=True)
 
+                    elif mtype == "agent_response":
+                        speaker = msg.get("speaker", current_speaker)
+                        content = msg.get("content", "")
+                        if speaker in transcripts:
+                            # Replace with latest complete turn (not append)
+                            transcripts[speaker] = [content]
+                        log.line(f"\n[{ts()}] 💬 AGENT RESPONSE [{speaker}]: {content[:120]}...")
+
                     elif mtype == "hallucination_detected":
                         spk = msg.get("speaker", "?")
                         hallucs.append(spk)
@@ -284,19 +292,29 @@ async def run_debate_test(event: str, log: Log, label: str, timeout_s: int = 300
         log.err(f"Connection error: {type(exc).__name__}: {exc}")
         return
 
-    # ── Summary ───────────────────────────────────────────────────────────────
+    # ── Summary (printed ONCE after stream fully completes) ──────────
     log.sub(f"SUMMARY — {label}")
     log.info(f"Mode       : {debate_mode}")
     log.info(f"Completed  : {'✅ Yes' if completed else '⚠️ No'}")
     log.info(f"Errors     : {len(errors)} {'— ' + '; '.join(errors[:2]) if errors else '(none)'}")
     log.info(f"Intercepts : {len(hallucs)} ({hallucs})")
-    log.info(f"MCP Calls  : {len(mcp_calls)}")
+
+    # Deduplicate MCP calls by (tool, ts) to prevent log repetition
+    seen_mcp: set = set()
+    deduped: list = []
     for c in mcp_calls:
+        key = (c["tool"], c["ts"])
+        if key not in seen_mcp:
+            seen_mcp.add(key)
+            deduped.append(c)
+
+    log.info(f"MCP Calls  : {len(deduped)}")
+    for c in deduped:
         tier_tag = f" [tier={c['tier']}]" if c.get("tier") else ""
         mode_tag = f" [{c['mode']}]" if c.get("mode") else ""
-        log.tool(f"{c['ts']} {c['tool']}(){tier_tag}{mode_tag}"
-                 + (f" articles={c['articles']}" if c.get("articles") != "" else "")
-                 + (f" ₹{c['price']}" if c.get("price") else ""))
+        art_tag  = f" articles={c['articles']}" if c.get("articles") != "" else ""
+        price_tag = f" ₹{c['price']}" if c.get("price") else ""
+        log.tool(f"{c['ts']} {c['tool']}(){tier_tag}{mode_tag}{art_tag}{price_tag}")
 
     log.info(f"Neo4j writes: {len(neo4j_writes)}")
     log.info(f"Stock Charts : {len(stock_charts)}")

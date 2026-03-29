@@ -20,7 +20,7 @@ import asyncio
 from datetime import datetime, timedelta
 import random
 import os
-
+import httpx
 from groq import Groq
 
 from backend.core.config import get_settings
@@ -128,15 +128,35 @@ async def fetch_et_news(query: str, timeframe: str = "7d") -> dict:
                     "q":         query,
                     "country":   "in",
                     "language":  "en",
-                    "domainurl": "economictimes.indiatimes.com",  # CRITICAL: domainurl not domain
+                    "domainurl": "economictimes.indiatimes.com",
                 },
             )
             response.raise_for_status()
             data = response.json()
 
         results = data.get("results", [])
+
+        # RETRY: if ET-specific search returned nothing, retry with broader Indian financial news
         if not results:
-            raise ValueError(f"NewsData.io returned 0 results for '{query}'")
+            logger.info(f"[fetch_et_news] TIER 1: No ET results, retrying without domain filter")
+            print(f"[MCP TIER-1] ♻ 0 ET results — retrying with broader Indian finance news")
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp2 = await client.get(
+                    "https://newsdata.io/api/1/latest",
+                    params={
+                        "apikey":    settings.newsdata_api_key,
+                        "q":         query,
+                        "country":   "in",
+                        "language":  "en",
+                        "category":  "business",  # broad Indian business news
+                    },
+                )
+                resp2.raise_for_status()
+                results = resp2.json().get("results", [])
+
+        if not results:
+            raise ValueError(f"NewsData.io: 0 results for '{query}' (both domain+broad searches)")
+
 
         # Extract top 3 articles
         articles = []
@@ -191,6 +211,9 @@ async def fetch_et_news(query: str, timeframe: str = "7d") -> dict:
             logger.info(f"[fetch_et_news] TIER 2: groq/compound web sub-agent for '{query}'")
             print(f"[MCP TIER-2] 🌐 groq/compound sub-agent searching for: '{query}'")
 
+            # Truncate query to 80 chars to prevent 413 Entity Too Large from groq/compound
+            safe_query = query[:80]
+
             def _call_compound():
                 client = Groq(
                     api_key=settings.groq_api_key,
@@ -200,11 +223,9 @@ async def fetch_et_news(query: str, timeframe: str = "7d") -> dict:
                     messages=[{
                         "role": "user",
                         "content": (
-                            f"Search the web for Indian financial news regarding: '{query}'. "
-                            f"Focus on Economic Times (economictimes.indiatimes.com). "
-                            f"Visit relevant links and summarize the market impact in 2-3 sentences. "
-                            f"Return JSON with keys: articles (list), market_impact_summary (string), "
-                            f"key_tickers (list). Raw JSON only."
+                            f"Search Indian financial news for: {safe_query!r}. "
+                            "Summarise market impact in 2 sentences. "
+                            "Reply JSON: {\"market_impact_summary\": str, \"key_tickers\": [str]}."
                         ),
                     }],
                     model="groq/compound",
@@ -322,7 +343,15 @@ async def get_nse_price(ticker: str) -> dict:
         import yfinance as yf
 
         sym = ticker.upper()
-        yf_sym = sym if sym.endswith(".NS") or sym.endswith(".BO") else f"{sym}.NS"
+        sym = ticker.upper()
+        # Add this mapping for major indices:
+        if sym == "NIFTY50":
+            yf_sym = "^NSEI"
+        elif sym == "SENSEX":
+            yf_sym = "^BSESN"
+        else:
+            yf_sym = sym if sym.endswith(".NS") or sym.endswith(".BO") else f"{sym}.NS"
+
 
         logger.info(f"[get_nse_price] Fetching live data for {yf_sym}")
         print(f"\n[MCP LIVE] 📈 yfinance fetching OHLCV for {yf_sym}")
