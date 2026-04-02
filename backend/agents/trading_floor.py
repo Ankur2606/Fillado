@@ -591,8 +591,8 @@ async def _run_agent_turn_live(
                 logger.error(f"[_run_agent_turn_live] Call 2 failed: {exc}", exc_info=True)
                 buffer += err
                 break
-        "content": "Now synthesize your findings and give your final trading perspective."
-    })
+    #     "content": "Now synthesize your findings and give your final trading perspective."
+    # })
 
     try:
         await asyncio.sleep(2) # Added a delay between calls
