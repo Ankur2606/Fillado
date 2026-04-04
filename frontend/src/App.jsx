@@ -11,7 +11,7 @@ import GraphIntelligence from './components/GraphIntelligence'
 
 // Auth Components
 import Login from './pages/Login'
-// import Signup from './pages/Signup'
+import SignUp from './pages/SignUp'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import { useWebSocket } from './hooks/useWebSocket'
 
@@ -146,7 +146,7 @@ export default function App() {
       <Router>
         <Routes>
           <Route path="/login" element={<Login />} />
-          {/* <Route path="/signup" element={<Signup />} /> */}
+          <Route path="/signup" element={<SignUp />} />
           <Route 
             path="/" 
             element={

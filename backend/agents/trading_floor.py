@@ -15,14 +15,19 @@ Live path  → _run_agent_turn_live  (manual 2-call function-calling loop)
 MOCK_EVENTS: events that use the mock path by default (safe for demo)
 Any other event string uses the live agent path.
 """
-from __future__ import annotations
 
+from __future__ import annotations
+import os
+from dotenv import load_dotenv
+
+# Load the .env file
+load_dotenv()
 import json
 import logging
 import asyncio
 from typing import TypedDict, Annotated, Callable, Awaitable, Any
 import operator
-
+from elevenlabs import ElevenLabs
 from langgraph.graph import StateGraph, END
 from groq import AsyncGroq
 
@@ -39,6 +44,32 @@ from backend.mcp_server.tools.read_tools import (
 from backend.mcp_server.tools.write_tools import append_causal_link
 from backend.middleware.thought_policeman import ThoughtPoliceman
 
+# ─── VOICE SETUP ──────────────────────────────────────────────────────────────
+# 🔊 ElevenLabs Setup
+eleven_client = ElevenLabs(api_key=os.getenv("VOICE_API_KEY"))
+
+VOICE_MAP = {
+    "retail": "6qYnWOkgUahRDF6OVOOO",
+    "whale": "YCI9VVvZULYKqb746qCf",
+    "contrarian": "YsiFxWm4GOB39X2MR7td"
+}
+
+async def speak_text(text: str, speaker: str):
+    try:
+        voice_id = VOICE_MAP.get(speaker)
+
+        # prevent long audio delay
+        text = text[:400]
+
+        audio = eleven_client.text_to_speech.convert(
+            voice_id=voice_id,
+            model_id="eleven_multilingual_v2",
+            text=text
+        )
+        return audio
+    except Exception as e:
+        print(f"[Voice Error] {e}")
+        return None
 logger = logging.getLogger(__name__)
 
 # ─── Model IDs ──────────────────────────────────────────────────────────────
@@ -57,7 +88,7 @@ def _is_mock_event(topic: str) -> bool:
     t = topic.lower().strip()
     return any(m in t for m in MOCK_EVENTS)
 
-MAX_TURNS = 3
+MAX_TURNS = 1
 
 
 # ─── LangGraph State ─────────────────────────────────────────────────────────
@@ -420,6 +451,16 @@ async def _run_agent_turn(
     # ── Broadcast ONE complete agent_response (frontend fake-streams this) ──
     await _broadcast({"type": "agent_response", "speaker": persona_key, "content": buffer})
 
+    audio = await speak_text(buffer, persona_key)
+
+    #ADDED VOICE
+    if audio:
+        await _broadcast({
+        "type": "agent_voice",
+        "speaker": persona_key,
+        "audio": audio
+    })
+        
     new_msg = {"speaker": persona_key, "content": buffer, "hallucinated": hallucination_triggered}
     return {
         **state,
@@ -534,7 +575,7 @@ async def _run_agent_turn_live(
         print(f"\n[{persona_name}] ⚠️ Call 1 error: {exc}")
         # Fall through to Call 2 with original messages (no tools)
 
-    # ── Call 2: Collect Full Final Answer (buffered, NOT per-token broadcast) ──
+        # ── Call 2: Collect Full Final Answer (buffered, NOT per-token broadcast) ──
     buffer = ""
     token_count = 0
     hallucination_triggered = False
@@ -545,7 +586,7 @@ async def _run_agent_turn_live(
         hallucination_triggered = True
         await _broadcast({"type": "hallucination_detected", "speaker": persona_key})
 
-    # Inject forceful no-tool instruction as system override
+    # Force final answer (no tool calls)
     messages.append({
         "role": "user",
         "content": (
@@ -559,20 +600,22 @@ async def _run_agent_turn_live(
         buffer = ""
         try:
             print(f"[{persona_name}] Call 2 → final answer (attempt {attempt+1})")
+
             stream = await client.chat.completions.create(
                 model=MODEL_LIVE_REASONING,
                 messages=messages,
-                # Deliberately NO tools parameter — prevents tool call entirely
                 max_tokens=600,
                 stream=True,
                 temperature=0.7,
             )
+
             async for chunk in stream:
                 delta = chunk.choices[0].delta.content or ""
                 if delta:
                     buffer += delta
                     token_count += 1
                     print(delta, end="", flush=True)
+
                     if not hallucination_triggered:
                         await policeman.check_drift(
                             objective=topic,
@@ -580,7 +623,9 @@ async def _run_agent_turn_live(
                             on_hallucination=on_hallucination,
                             token_count=token_count,
                         )
+
             break  # success
+
         except Exception as exc:
             if "429" in str(exc) and attempt < 2:
                 wait = (attempt + 1) * 10
@@ -591,45 +636,52 @@ async def _run_agent_turn_live(
                 logger.error(f"[_run_agent_turn_live] Call 2 failed: {exc}", exc_info=True)
                 buffer += err
                 break
-        "content": "Now synthesize your findings and give your final trading perspective."
-    })
 
-    try:
-        await asyncio.sleep(2) # Added a delay between calls
-        print(f"[{persona_name}] Call 2 → streaming final answer ({MODEL_LIVE_REASONING})")
-        stream = await client.chat.completions.create(
-            model=MODEL_LIVE_REASONING,
-            messages=messages,
-            # NO tools on Call 2 — forces the model to generate prose, not tool calls
-            max_tokens=600,
-            stream=True,
-            reasoning_effort="medium",
-        )
-        async for chunk in stream:
-            delta = chunk.choices[0].delta.content or ""
-            if delta:
-                buffer += delta
-                token_count += 1
-                print(delta, end="", flush=True)
-                await _broadcast({"type": "token", "speaker": persona_key, "content": delta})
-                if not hallucination_triggered:
-                    await policeman.check_drift(
-                        objective=topic,
-                        generation_buffer=buffer,
-                        on_hallucination=on_hallucination,
-                        token_count=token_count,
-                    )
-    except Exception as exc:
-        err = f"\n🛑 **Live Stream Error**: {type(exc).__name__} — {exc}\n"
-        logger.error(f"[_run_agent_turn_live] Call 2 failed: {exc}", exc_info=True)
-        print(err)
-        buffer += err
-        await _broadcast({"type": "token", "speaker": persona_key, "content": err})
+    # try:
+    #     await asyncio.sleep(2) # Added a delay between calls
+    #     print(f"[{persona_name}] Call 2 → streaming final answer ({MODEL_LIVE_REASONING})")
+    #     stream = await client.chat.completions.create(
+    #         model=MODEL_LIVE_REASONING,
+    #         messages=messages,
+    #         # NO tools on Call 2 — forces the model to generate prose, not tool calls
+    #         max_tokens=600,
+    #         stream=True,
+    #         reasoning_effort="medium",
+    #     )
+    #     async for chunk in stream:
+    #         delta = chunk.choices[0].delta.content or ""
+    #         if delta:
+    #             buffer += delta
+    #             token_count += 1
+    #             print(delta, end="", flush=True)
+    #             await _broadcast({"type": "token", "speaker": persona_key, "content": delta})
+    #             if not hallucination_triggered:
+    #                 await policeman.check_drift(
+    #                     objective=topic,
+    #                     generation_buffer=buffer,
+    #                     on_hallucination=on_hallucination,
+    #                     token_count=token_count,
+    #                 )
+    # except Exception as exc:
+    #     err = f"\n🛑 **Live Stream Error**: {type(exc).__name__} — {exc}\n"
+    #     logger.error(f"[_run_agent_turn_live] Call 2 failed: {exc}", exc_info=True)
+    #     print(err)
+    #     buffer += err
+    #     await _broadcast({"type": "token", "speaker": persona_key, "content": err})
 
     print(f"\n[{persona_name} FINISHED — LIVE] {token_count} tokens, tools: {tool_calls_made}")
     # ── Broadcast ONE complete agent_response (frontend fake-streams it) ──
     await _broadcast({"type": "agent_response", "speaker": persona_key, "content": buffer})
 
+    #VOICE
+    audio = await speak_text(buffer, persona_key)
+
+    if audio:
+        await _broadcast({
+        "type": "agent_voice",
+        "speaker": persona_key,
+        "audio": audio
+    })
     new_msg = {
         "speaker": persona_key,
         "content": buffer,

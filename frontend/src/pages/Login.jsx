@@ -1,43 +1,64 @@
-import { useState } from 'react';
-import { useAuth } from '../context/AuthContext';
-import { useNavigate } from 'react-router-dom';
+import { useState } from "react";
+import { Link } from "react-router-dom";
+import API from "../api/axios";
+import { useNavigate } from "react-router-dom";
 
-const Login = () => {
-    const [email, setEmail] = useState('');
-    const [password, setPassword] = useState('');
-    const { login } = useAuth();
-    const navigate = useNavigate();
+export default function Login() {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading,setLoading] = useState(false);
+  const navigate = useNavigate();
 
-    const handleSubmit = async (e) => {
-        e.preventDefault();
-        try {
-            await login(email, password);
-            navigate('/dashboard'); // Go to the Trading Floor
-        } catch (err) {
-            alert("Login Failed: Check your credentials");
-        }
-    };
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    try {
+      const res = await API.post("/api/auth/login", { email, password });
+      localStorage.setItem("token", res.data.access_token);
+      navigate("/");
+    } catch {
+      setError("Invalid credentials");
+    }
+  };
 
-    return (
-        <div className="min-h-screen flex items-center justify-center bg-slate-900 text-white">
-            <form onSubmit={handleSubmit} className="bg-slate-800 p-8 rounded-lg shadow-xl w-96 border border-slate-700">
-                <h2 className="text-3xl font-bold mb-6 text-blue-400">Fillado Login</h2>
-                <input 
-                    type="email" placeholder="Email" 
-                    className="w-full p-3 mb-4 bg-slate-700 rounded border border-slate-600 focus:outline-none focus:border-blue-500"
-                    onChange={(e) => setEmail(e.target.value)} 
-                />
-                <input 
-                    type="password" placeholder="Password" 
-                    className="w-full p-3 mb-6 bg-slate-700 rounded border border-slate-600 focus:outline-none focus:border-blue-500"
-                    onChange={(e) => setPassword(e.target.value)} 
-                />
-                <button type="submit" className="w-full bg-blue-600 hover:bg-blue-500 p-3 rounded font-bold transition">
-                    Enter Trading Floor
-                </button>
-            </form>
-        </div>
-    );
-};
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-[#0b1120]">
 
-export default Login;
+      <div className="w-full max-w-md bg-[#111827] border border-[#1f2937] rounded-2xl p-8 shadow-xl">
+
+        <h2 className="text-2xl font-semibold text-white text-center mb-6">
+          Welcome Back
+        </h2>
+
+        {error && (
+          <p className="text-red-400 text-sm mb-3 text-center">{error}</p>
+        )}
+
+        <form onSubmit={handleLogin} className="space-y-4">
+
+          <input
+            className="input"
+            placeholder="Email"
+            onChange={(e) => setEmail(e.target.value)}
+          />
+
+          <input
+            className="input"
+            type="password"
+            placeholder="Password"
+            onChange={(e) => setPassword(e.target.value)}
+          />
+
+          <button className="btn" onClick={setLoading(true)}>{loading? "logging in": "Login" }</button>
+        </form>
+
+        <p className="text-gray-400 text-sm text-center mt-5">
+          Don’t have an account?{" "}
+          <Link to="/signup" className="text-blue-400 hover:underline">
+            Sign up
+          </Link>
+        </p>
+      </div>
+    </div>
+  );
+}
