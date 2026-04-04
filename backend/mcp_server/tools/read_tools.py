@@ -342,19 +342,23 @@ async def get_nse_price(ticker: str) -> dict:
     try:
         import yfinance as yf
 
-        sym = ticker.upper()
-        sym = ticker.upper()
+        # Normalize: strip whitespace, uppercase, avoid double-suffix bugs (e.g. HPCL.NS.NS)
+        raw_input = ticker
+        sym = ticker.strip().upper()
         # Add this mapping for major indices:
         if sym == "NIFTY50":
             yf_sym = "^NSEI"
         elif sym == "SENSEX":
             yf_sym = "^BSESN"
+        elif sym.endswith(".NS") or sym.endswith(".BO"):
+            yf_sym = sym  # already has a valid exchange suffix — use as-is
         else:
-            yf_sym = sym if sym.endswith(".NS") or sym.endswith(".BO") else f"{sym}.NS"
+            yf_sym = f"{sym}.NS"
 
-
+        print(f"[get_nse_price] Resolved ticker: {raw_input} → {yf_sym}")
         logger.info(f"[get_nse_price] Fetching live data for {yf_sym}")
         print(f"\n[MCP LIVE] 📈 yfinance fetching OHLCV for {yf_sym}")
+
 
         def _fetch():
             t = yf.Ticker(yf_sym)
@@ -471,6 +475,8 @@ async def execute_graphrag_query(unstructured_query: str) -> dict:
     transformer = GraphRAGTransformer()
     result = await transformer.transform(unstructured_query)
     transformer.close()
+    print("unstructured query",unstructured_query)
+    print("result",result)
     return {
         "tool": "execute_graphrag_query",
         "query": unstructured_query,

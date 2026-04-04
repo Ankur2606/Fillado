@@ -199,9 +199,34 @@ final objective trading signal. Produce ONLY valid JSON (no markdown) with these
   PRIMARY_TICKER: top NSE ticker
   SECONDARY_TICKERS: list of up to 3 NSE tickers
   TIME_HORIZON: intraday | swing | positional
-  CAUSAL_CHAIN: "Source ➜ Relationship ➜ Target"
+  CAUSAL_GRAPH: list of causal link objects (minimum 5 links — see rules and example below)
   RATIONALE: 2-sentence summary
-"""
+
+CAUSAL_GRAPH rules:
+  - Each object must have: source, relationship, target, tier, confidence
+  - relationship must be SCREAMING_SNAKE_CASE from: DISRUPTS, DELAYS, IMPACTS, SUPPLY_CHAIN_RISK, RIPPLES
+  - tier must be an integer 1, 2, or 3 — NEVER a string
+  - confidence must be a float 0.0-1.0 — NEVER a percentage string
+  - Tier 1 = event actor → disrupted entity, Tier 2 = disrupted entity → NSE ticker, Tier 3 = ticker → downstream ticker/sector
+
+Few-shot example output (replace with values relevant to the actual event):
+{
+  "CONSENSUS": "BEARISH",
+  "CONFIDENCE_PCT": 72,
+  "PRIMARY_TICKER": "ADANIPORTS",
+  "SECONDARY_TICKERS": ["CONCOR", "MAHLOG"],
+  "TIME_HORIZON": "swing",
+  "CAUSAL_GRAPH": [
+    {"source": "Transport Strike", "relationship": "DISRUPTS", "target": "Gujarat Logistics", "tier": 1, "confidence": 0.88},
+    {"source": "Gujarat Logistics", "relationship": "DELAYS", "target": "ADANIPORTS", "tier": 2, "confidence": 0.72},
+    {"source": "Gujarat Logistics", "relationship": "IMPACTS", "target": "GUJGASLTD", "tier": 2, "confidence": 0.68},
+    {"source": "ADANIPORTS", "relationship": "SUPPLY_CHAIN_RISK", "target": "CONCOR", "tier": 3, "confidence": 0.61},
+    {"source": "GUJGASLTD", "relationship": "RIPPLES", "target": "IGL", "tier": 3, "confidence": 0.55}
+  ],
+  "RATIONALE": "The transport strike cascades through Gujarat logistics into port and gas distribution stocks. Bearish pressure on ADANIPORTS and GUJGASLTD expected over 3-5 day swing horizon."
+}
+
+Return ONLY the raw JSON object starting directly with the opening curly brace, no markdown, no explanation."""
 
 
 # ─── Tool JSON schemas for openai/gpt-oss-120b function-calling ─────────────
@@ -566,17 +591,20 @@ async def _run_agent_turn_live(
         )
     })
 
+    # ── Call 2: Single streaming block with retry (reasoning_effort + per-token broadcast) ──
     for attempt in range(3):
-        buffer = ""
         try:
-            print(f"[{persona_name}] Call 2 → final answer (attempt {attempt+1})")
+            await asyncio.sleep(2)  # pacing delay
+            LLM_REQUEST_COUNT += 1
+            print(f"[{LLM_REQUEST_COUNT}] 🚀 [Groq Request] model={MODEL_LIVE_REASONING} (Call 2: Stream, attempt {attempt+1})")
+            print(f"[{persona_name}] Call 2 → streaming final answer ({MODEL_LIVE_REASONING})")
             stream = await client.chat.completions.create(
                 model=MODEL_LIVE_REASONING,
                 messages=messages,
-                # Deliberately NO tools parameter — prevents tool call entirely
+                # NO tools on Call 2 — forces the model to generate prose, not tool calls
                 max_tokens=600,
                 stream=True,
-                temperature=0.7,
+                reasoning_effort="medium",
             )
             async for chunk in stream:
                 delta = chunk.choices[0].delta.content or ""
@@ -584,60 +612,27 @@ async def _run_agent_turn_live(
                     buffer += delta
                     token_count += 1
                     print(delta, end="", flush=True)
-                    if not hallucination_triggered:
+                    await _broadcast({"type": "token", "speaker": persona_key, "content": delta})
+                    if not hallucination_triggered and token_count >= 200:
                         await policeman.check_drift(
                             objective=topic,
                             generation_buffer=buffer,
                             on_hallucination=on_hallucination,
                             token_count=token_count,
                         )
-            break  # success
+            break  # success — exit retry loop
         except Exception as exc:
             if "429" in str(exc) and attempt < 2:
                 wait = (attempt + 1) * 10
                 print(f"\n[{persona_name}] ⚡ 429 rate-limit, waiting {wait}s...")
                 await asyncio.sleep(wait)
             else:
-                err = f"\n🛑 **Live Error**: {type(exc).__name__} — {exc}\n"
+                err = f"\n🛑 **Live Stream Error**: {type(exc).__name__} — {exc}\n"
                 logger.error(f"[_run_agent_turn_live] Call 2 failed: {exc}", exc_info=True)
+                print(err)
                 buffer += err
+                await _broadcast({"type": "token", "speaker": persona_key, "content": err})
                 break
-    #     "content": "Now synthesize your findings and give your final trading perspective."
-    # })
-
-    try:
-        await asyncio.sleep(2) # Added a delay between calls
-        LLM_REQUEST_COUNT += 1
-        print(f"[{LLM_REQUEST_COUNT}] 🚀 [Groq Request] model={MODEL_LIVE_REASONING} (Call 2: Stream)")
-        print(f"[{persona_name}] Call 2 → streaming final answer ({MODEL_LIVE_REASONING})")
-        stream = await client.chat.completions.create(
-            model=MODEL_LIVE_REASONING,
-            messages=messages,
-            # NO tools on Call 2 — forces the model to generate prose, not tool calls
-            max_tokens=600,
-            stream=True,
-            reasoning_effort="medium",
-        )
-        async for chunk in stream:
-            delta = chunk.choices[0].delta.content or ""
-            if delta:
-                buffer += delta
-                token_count += 1
-                print(delta, end="", flush=True)
-                await _broadcast({"type": "token", "speaker": persona_key, "content": delta})
-                if not hallucination_triggered:
-                    await policeman.check_drift(
-                        objective=topic,
-                        generation_buffer=buffer,
-                        on_hallucination=on_hallucination,
-                        token_count=token_count,
-                    )
-    except Exception as exc:
-        err = f"\n🛑 **Live Stream Error**: {type(exc).__name__} — {exc}\n"
-        logger.error(f"[_run_agent_turn_live] Call 2 failed: {exc}", exc_info=True)
-        print(err)
-        buffer += err
-        await _broadcast({"type": "token", "speaker": persona_key, "content": err})
 
     print(f"\n[{persona_name} FINISHED — LIVE] {token_count} tokens, tools: {tool_calls_made}")
     # ── Broadcast ONE complete agent_response (frontend fake-streams it) ──
@@ -713,7 +708,7 @@ async def synthesis_node(state: DebateState) -> DebateState:
         raw = json.dumps({
             "CONSENSUS": "NEUTRAL", "CONFIDENCE_PCT": 50,
             "PRIMARY_TICKER": "NIFTY50", "SECONDARY_TICKERS": [],
-            "TIME_HORIZON": "swing", "CAUSAL_CHAIN": "", "RATIONALE": str(exc),
+            "TIME_HORIZON": "swing", "CAUSAL_GRAPH": [], "RATIONALE": str(exc),
         })
 
     # Broadcast complete synthesis text as one message (frontend fake-streams it)
@@ -763,21 +758,62 @@ async def synthesis_node(state: DebateState) -> DebateState:
         except Exception as exc:
             logger.error(f"[synthesis_node] yfinance for {ticker} failed: {exc}")
 
-    # ── Write new causal link to Neo4j ──────────────────────────────────────
-    if "CAUSAL_CHAIN" in signal:
-        link_str = str(signal["CAUSAL_CHAIN"])
-        parts = [p.strip() for p in link_str.split("➜")]
-        if len(parts) == 3:
-            try:
-                print(f"[Synthesis] 🔗 Writing causal link: {parts}")
-                await _broadcast({"type": "mcp_tool", "tool": "append_causal_link",
-                                   "data": {"source": parts[0], "rel": parts[1], "target": parts[2]}})
-                result = await append_causal_link(source=parts[0], relationship=parts[1], target=parts[2])
-                causal_chain.append({"source": parts[0], "relationship": parts[1], "target": parts[2]})
-                await _broadcast({"type": "graph_update", "data": result})
-                print(f"[Synthesis] ✅ Neo4j write: {result.get('message', result)}")
-            except Exception as exc:
-                logger.error(f"[synthesis_node] append_causal_link failed: {exc}")
+    # ── Write hierarchical causal graph to Neo4j ────────────────────────────
+    # Normalise to a list of link dicts regardless of whether the LLM returned
+    # the new CAUSAL_GRAPH list or the legacy CAUSAL_CHAIN "A ➜ B ➜ C" string.
+    raw_links: list[dict] = []
+    if isinstance(signal.get("CAUSAL_GRAPH"), list):
+        raw_links = signal["CAUSAL_GRAPH"]
+    else:
+        print("[Synthesis FALLBACK] CAUSAL_GRAPH missing or not a list — attempting old CAUSAL_CHAIN string parse")
+        if "CAUSAL_CHAIN" in signal:
+            link_str = str(signal["CAUSAL_CHAIN"])
+            parts = [p.strip() for p in link_str.split("➜")]
+            if len(parts) == 3:
+                raw_links = [{"source": parts[0], "relationship": parts[1], "target": parts[2], "tier": 1, "confidence": 0.75}]
+
+    written_count = 0
+    failed_count = 0
+    for link in raw_links:
+        src = link.get("source", "")
+        rel = link.get("relationship", "")
+        tgt = link.get("target", "")
+        link_tier = int(link.get("tier", 1))
+        link_conf = float(link.get("confidence", 0.75))
+
+        if not (isinstance(src, str) and src.strip() and isinstance(tgt, str) and tgt.strip()):
+            print(f"[Synthesis FALLBACK] Skipping link with empty source/target: {link}")
+            failed_count += 1
+            continue
+
+        try:
+            await _broadcast({
+                "type": "mcp_tool",
+                "tool": "append_causal_link",
+                "data": {"source": src, "rel": rel, "target": tgt, "tier": link_tier, "confidence": link_conf},
+            })
+            result = await append_causal_link(
+                source=src, relationship=rel, target=tgt,
+                tier=link_tier, confidence=link_conf,
+            )
+            if result.get("success", False):
+                causal_chain.append({"source": src, "relationship": rel, "target": tgt, "tier": link_tier, "confidence": link_conf})
+                await _broadcast({
+                    "type": "graph_update",
+                    "data": result,
+                    "tier": link_tier,
+                    "confidence": link_conf,
+                })
+                print(f"[Synthesis] ✅ Neo4j wrote tier-{link_tier}: {src} ➜ {rel} ➜ {tgt}")
+                written_count += 1
+            else:
+                print(f"[Synthesis] ❌ Neo4j failed: {src}→{tgt}: {result.get('error')}")
+                failed_count += 1
+        except Exception as exc:
+            logger.error(f"[synthesis_node] append_causal_link failed: {exc}")
+            failed_count += 1
+
+    print(f"[Synthesis] Graph write complete — written: {written_count} failed: {failed_count}")
 
     await _broadcast({
         "type": "synthesis_complete", 
