@@ -12,6 +12,12 @@ from groq import AsyncGroq
 from neo4j import GraphDatabase, exceptions as neo4j_exceptions
 
 from backend.core.config import get_settings
+from backend.core.key_manager import (
+    get_groq_client,
+    get_neo4j_credentials,
+    report_groq_error,
+    report_groq_success,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,19 +75,23 @@ class GraphRAGTransformer:
 
     def __init__(self):
         self.settings = get_settings()
-        self.groq_client = AsyncGroq(api_key=self.settings.groq_api_key) if self.settings.groq_api_key else None
+        # Do NOT fix a Groq client at construction time — call get_groq_client()
+        # inside _extract_entities so every call rotates to the next healthy key.
+        self.groq_client = None
         self._driver = None
         self._init_neo4j()
 
     def _init_neo4j(self):
-        if not self.settings.neo4j_uri:
+        try:
+            uri, user, pwd = get_neo4j_credentials()
+        except Exception:
+            uri, user, pwd = self.settings.neo4j_uri, self.settings.neo4j_username, self.settings.neo4j_password
+
+        if not uri:
             logger.warning("NEO4J_URI not set – GraphRAG will use mock data.")
             return
         try:
-            self._driver = GraphDatabase.driver(
-                self.settings.neo4j_uri,
-                auth=(self.settings.neo4j_username, self.settings.neo4j_password),
-            )
+            self._driver = GraphDatabase.driver(uri, auth=(user, pwd))
             self._driver.verify_connectivity()
             logger.info("Connected to Neo4j AuraDB ✓")
         except Exception as exc:
@@ -156,8 +166,11 @@ class GraphRAGTransformer:
         return mock
 
     async def _extract_entities(self, text: str) -> dict:
-        """Use Groq 8B to extract entities + full hierarchical causal graph as JSON."""
-        if not self.groq_client:
+        """Use Groq 8B to extract entities + full hierarchical causal graph as JSON.
+        A fresh client (and thus fresh key) is obtained on every call via get_groq_client().
+        """
+        groq_client = get_groq_client()
+        if not groq_client:
             return {
                 "entities": ["Gujarat", "Transport"],
                 "causal_chain": [
@@ -167,6 +180,7 @@ class GraphRAGTransformer:
                 "intent": "supply_chain_disruption",
                 "sector": "Logistics",
             }
+        used_key = groq_client.api_key
 
         prompt = f"""You are a financial NLP model specialising in Indian equity markets.
 Extract a full hierarchical causal graph from the market event below.
@@ -208,7 +222,7 @@ Few-shot example (for an unrelated event — do NOT copy these values):
 Now extract from the actual event above. Return ONLY the raw JSON object, no markdown fences, no backticks, no explanation text before or after, starting directly with the opening curly brace."""
 
         try:
-            response = await self.groq_client.chat.completions.create(
+            response = await groq_client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
@@ -217,7 +231,9 @@ Now extract from the actual event above. Return ONLY the raw JSON object, no mar
             raw = response.choices[0].message.content.strip()
             # Strip any accidental markdown fences
             raw = raw.replace("```json", "").replace("```", "").strip()
+            report_groq_success(used_key)
         except Exception as exc:
+            report_groq_error(used_key)
             print(f"[GraphRAG FALLBACK] Groq call threw {type(exc).__name__}: {exc}")
             return {"entities": [], "causal_chain": [], "affected_tickers": [], "intent": "", "sector": ""}
 

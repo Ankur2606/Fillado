@@ -24,6 +24,7 @@ import httpx
 from groq import Groq
 
 from backend.core.config import get_settings
+from backend.core.key_manager import get_newsdata_key, report_newsdata_error
 
 logger = logging.getLogger(__name__)
 
@@ -114,45 +115,50 @@ async def fetch_et_news(query: str, timeframe: str = "7d") -> dict:
 
     # ─── TIER 1: NewsData.io API ─────────────────────────────────────────────
     try:
-        if not settings.newsdata_api_key:
+        nd_key = get_newsdata_key()
+        if not nd_key or nd_key == "__no_newsdata_key__":
+            # Also accept the legacy single-key path as a fallback
+            nd_key = settings.newsdata_api_key
+        if not nd_key:
             raise ValueError("NEWSDATA_API_KEY not configured — skipping to Tier 2")
 
         logger.info(f"[fetch_et_news] TIER 1: NewsData.io for '{query}'")
         print(f"\n[MCP TIER-1] 📰 NewsData.io → ET search for: '{query}'")
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                "https://newsdata.io/api/1/latest",
-                params={
-                    "apikey": settings.newsdata_api_key,
-                    "q":         query,
-                    "country":   "in",
-                    "language":  "en",
-                    "domainurl": "economictimes.indiatimes.com",
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
+        async def _newsdata_get(params: dict) -> dict:
+            """Makes a NewsData.io GET call; retries once with a fresh key on 401/429."""
+            nonlocal nd_key
+            for _attempt in range(2):
+                async with httpx.AsyncClient(timeout=10.0) as http:
+                    resp = await http.get("https://newsdata.io/api/1/latest", params={**params, "apikey": nd_key})
+                    if resp.status_code in (401, 429):
+                        report_newsdata_error(nd_key)
+                        nd_key = get_newsdata_key()  # rotate to next key
+                        print(f"[MCP TIER-1] ⚠️ HTTP {resp.status_code} — rotating NewsData key, retry {_attempt+1}")
+                        continue
+                    resp.raise_for_status()
+                    return resp.json()
+            raise ValueError(f"NewsData.io: all key attempts exhausted (last status {resp.status_code})")
 
+        data = await _newsdata_get({
+            "q":         query,
+            "country":   "in",
+            "language":  "en",
+            "domainurl": "economictimes.indiatimes.com",
+        })
         results = data.get("results", [])
 
         # RETRY: if ET-specific search returned nothing, retry with broader Indian financial news
         if not results:
             logger.info(f"[fetch_et_news] TIER 1: No ET results, retrying without domain filter")
             print(f"[MCP TIER-1] ♻ 0 ET results — retrying with broader Indian finance news")
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp2 = await client.get(
-                    "https://newsdata.io/api/1/latest",
-                    params={
-                        "apikey":    settings.newsdata_api_key,
-                        "q":         query,
-                        "country":   "in",
-                        "language":  "en",
-                        "category":  "business",  # broad Indian business news
-                    },
-                )
-                resp2.raise_for_status()
-                results = resp2.json().get("results", [])
+            data2 = await _newsdata_get({
+                "q":         query,
+                "country":   "in",
+                "language":  "en",
+                "category":  "business",
+            })
+            results = data2.get("results", [])
 
         if not results:
             raise ValueError(f"NewsData.io: 0 results for '{query}' (both domain+broad searches)")

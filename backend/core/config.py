@@ -9,14 +9,17 @@ from functools import lru_cache
 class Settings(BaseSettings):
     # Groq
     groq_api_key: str = ""
+    groq_api_keys: str = ""          # comma-separated multi-key (optional)
 
     # NewsData.io (Tier 1 news fetcher)
     newsdata_api_key: str = ""
+    newsdata_api_keys: str = ""      # comma-separated multi-key (optional)
 
     # Neo4j AuraDB
     neo4j_uri: str = ""
     neo4j_username: str = "neo4j"
     neo4j_password: str = ""
+    neo4j_uris: str = ""             # pipe-separated multi-instance (optional)
 
     # App
     debug: bool = True

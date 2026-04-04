@@ -27,6 +27,11 @@ from langgraph.graph import StateGraph, END
 from groq import AsyncGroq
 
 from backend.core.config import get_settings
+from backend.core.key_manager import (
+    get_groq_client,
+    report_groq_error,
+    report_groq_success,
+)
 from backend.mcp_server.tools.read_tools import (
     execute_graphrag_query,
     fetch_et_news_mock,
@@ -80,16 +85,18 @@ class DebateState(TypedDict):
 # ─── Groq client factory ─────────────────────────────────────────────────────
 
 def _groq_client() -> AsyncGroq:
-    return AsyncGroq(api_key=get_settings().groq_api_key)
+    """Returns a fresh AsyncGroq client from the key-rotation pool."""
+    return get_groq_client()
 
 
 # ─── Streaming helpers ───────────────────────────────────────────────────────
 
 async def _stream_groq(system: str, user: str, model: str = MODEL_FAST_STREAM,
                        max_tokens: int = 512):
-    """Yields text chunks from Groq streaming. Used on the mock path."""
-    client = _groq_client()
+    """Yields text chunks from Groq streaming. Rotates to a fresh key on each 429 retry."""
     for attempt in range(3):
+        client = get_groq_client()   # fresh key each attempt
+        used_key = client.api_key
         try:
             global LLM_REQUEST_COUNT
             LLM_REQUEST_COUNT += 1
@@ -108,15 +115,18 @@ async def _stream_groq(system: str, user: str, model: str = MODEL_FAST_STREAM,
                 delta = chunk.choices[0].delta.content or ""
                 if delta:
                     yield delta
+            report_groq_success(used_key)
             return  # success — exit retry loop
         except Exception as e:
             err_str = str(e)
             if "429" in err_str and attempt < 2:
+                # 429 = rate-limit, not a key failure — just back off and rotate
                 wait = (attempt + 1) * 8
                 logger.warning(f"[_stream_groq] 429 rate-limit, retrying in {wait}s...")
                 print(f"\n[Groq] ⚡ Rate-limited, cooling down {wait}s...")
                 await asyncio.sleep(wait)
             else:
+                report_groq_error(used_key)
                 logger.error(f"[_stream_groq] failed: {e}")
                 yield f"\n[System Error: LLM stream failed — {e}]"
                 return
@@ -126,8 +136,7 @@ async def _collect_groq(system: str, user: str,
                          model: str = MODEL_LIVE_REASONING,
                          max_tokens: int = 1024,
                          reasoning_effort: str | None = None) -> str:
-    """Collects a full (non-streaming) response from Groq with 429 retry."""
-    client = _groq_client()
+    """Collects a full (non-streaming) response from Groq. Rotates key on each 429 retry."""
     kwargs: dict[str, Any] = dict(
         model=model,
         messages=[
@@ -140,19 +149,24 @@ async def _collect_groq(system: str, user: str,
     if reasoning_effort:
         kwargs["reasoning_effort"] = reasoning_effort
     for attempt in range(3):
+        client = get_groq_client()   # fresh key each attempt
+        used_key = client.api_key
         try:
             global LLM_REQUEST_COUNT
             LLM_REQUEST_COUNT += 1
             print(f"[{LLM_REQUEST_COUNT}] 🚀 [Groq Request] model={model} (Collect)")
             response = await client.chat.completions.create(**kwargs)
+            report_groq_success(used_key)
             return response.choices[0].message.content.strip()
         except Exception as e:
             if "429" in str(e) and attempt < 2:
+                # 429 = rate-limit, not a key failure — rotate and retry
                 wait = (attempt + 1) * 10
                 logger.warning(f"[_collect_groq] 429 rate-limit, retrying in {wait}s...")
                 print(f"\n[Groq] ⚡ Rate-limited, cooling down {wait}s...")
                 await asyncio.sleep(wait)
             else:
+                report_groq_error(used_key)
                 raise
 
 
@@ -501,7 +515,7 @@ async def _run_agent_turn_live(
         {"role": "user",   "content": user_content},
     ]
 
-    client = _groq_client()
+    client = get_groq_client()  # initial client; replaced on 429 retries below
     await _broadcast({"type": "speaker_change", "speaker": persona_key})
     await asyncio.sleep(0.01)
     await _broadcast({"type": "token", "speaker": persona_key, "content": " *[Researching with live tools...]* "})
@@ -593,12 +607,14 @@ async def _run_agent_turn_live(
 
     # ── Call 2: Single streaming block with retry (reasoning_effort + per-token broadcast) ──
     for attempt in range(3):
+        call2_client = get_groq_client()  # fresh key per attempt — rotates on 429
+        call2_key = call2_client.api_key
         try:
             await asyncio.sleep(2)  # pacing delay
             LLM_REQUEST_COUNT += 1
             print(f"[{LLM_REQUEST_COUNT}] 🚀 [Groq Request] model={MODEL_LIVE_REASONING} (Call 2: Stream, attempt {attempt+1})")
             print(f"[{persona_name}] Call 2 → streaming final answer ({MODEL_LIVE_REASONING})")
-            stream = await client.chat.completions.create(
+            stream = await call2_client.chat.completions.create(
                 model=MODEL_LIVE_REASONING,
                 messages=messages,
                 # NO tools on Call 2 — forces the model to generate prose, not tool calls
@@ -620,13 +636,16 @@ async def _run_agent_turn_live(
                             on_hallucination=on_hallucination,
                             token_count=token_count,
                         )
+            report_groq_success(call2_key)
             break  # success — exit retry loop
         except Exception as exc:
             if "429" in str(exc) and attempt < 2:
+                # 429 = rate-limit, not a key failure — rotate and retry
                 wait = (attempt + 1) * 10
                 print(f"\n[{persona_name}] ⚡ 429 rate-limit, waiting {wait}s...")
                 await asyncio.sleep(wait)
             else:
+                report_groq_error(call2_key)
                 err = f"\n🛑 **Live Stream Error**: {type(exc).__name__} — {exc}\n"
                 logger.error(f"[_run_agent_turn_live] Call 2 failed: {exc}", exc_info=True)
                 print(err)

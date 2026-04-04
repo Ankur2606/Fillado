@@ -9,6 +9,7 @@ import logging
 import re
 
 from backend.core.config import get_settings
+from backend.core.key_manager import get_neo4j_credentials, _neo4j_pool
 
 logger = logging.getLogger(__name__)
 
@@ -83,12 +84,13 @@ async def append_causal_link(
             "tier": tier, "confidence": confidence,
         }
 
-    # ── Live Neo4j write (in thread executor) ─────────────────────────────────
+    # ── Live Neo4j write (in thread executor) ────────────────────────────────────────────
     def _sync_write():
         from neo4j import GraphDatabase, exceptions as neo4j_exc
+        neo4j_uri, neo4j_user, neo4j_pwd = get_neo4j_credentials()
         driver = GraphDatabase.driver(
-            settings.neo4j_uri,
-            auth=(settings.neo4j_username, settings.neo4j_password),
+            neo4j_uri,
+            auth=(neo4j_user, neo4j_pwd),
             max_connection_lifetime=300,
             connection_timeout=15,
         )
@@ -128,6 +130,10 @@ async def append_causal_link(
                 driver.close()
             except Exception:
                 pass
+            # Mark the Neo4j instance failed if it looks like a connectivity issue
+            err_str = str(exc).lower()
+            if any(kw in err_str for kw in ("name or service not known", "connection refused", "timed out", "dns")):
+                _neo4j_pool.mark_failed(neo4j_uri)
             raise exc
 
     try:
