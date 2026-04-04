@@ -79,10 +79,25 @@ class GraphRAGTransformer:
         except Exception as exc:
             logger.error(f"GraphRAGTransformer error: {exc}")
 
-        # Enrich mock with extracted entities if possible
-        mock = dict(MOCK_GRAPH)
-        mock["event"] = raw_event
-        return mock
+        # If live graph fails or doesn't match, avoid hardcoding Gujarat details into unrelated events
+        t = raw_event.lower()
+        if "gujarat" in t or "strike" in t or "cyclone" in t or "hosur" in t:
+            mock = dict(MOCK_GRAPH)
+            mock["event"] = raw_event
+            return mock
+            
+        # Build dynamic blank-slate graph to avoid polluting agent context
+        extracted_entities = entities.get("entities", [])
+        return {
+            "event": raw_event,
+            "entities": extracted_entities,
+            "causal_chain": [
+                {"source": e, "relationship": "IMPACTS", "target": "MARKET_VOLATILITY"} for e in extracted_entities[:2]
+            ],
+            "affected_tickers": [],
+            "signal_strength": "UNCERTAIN",
+            "confidence": 0.50,
+        }
 
     async def _extract_entities(self, text: str) -> dict:
         """Use Groq 8B to extract entities + intent as JSON."""

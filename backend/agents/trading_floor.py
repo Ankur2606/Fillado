@@ -41,6 +41,8 @@ from backend.middleware.thought_policeman import ThoughtPoliceman
 
 logger = logging.getLogger(__name__)
 
+LLM_REQUEST_COUNT = 0
+
 # ─── Model IDs ──────────────────────────────────────────────────────────────
 MODEL_LIVE_REASONING = "openai/gpt-oss-120b"   # main agents + synthesis (live path)
 MODEL_FAST_STREAM    = "llama-3.3-70b-versatile" # mock path streaming
@@ -57,7 +59,7 @@ def _is_mock_event(topic: str) -> bool:
     t = topic.lower().strip()
     return any(m in t for m in MOCK_EVENTS)
 
-MAX_TURNS = 3
+MAX_TURNS = 1
 
 
 # ─── LangGraph State ─────────────────────────────────────────────────────────
@@ -89,6 +91,9 @@ async def _stream_groq(system: str, user: str, model: str = MODEL_FAST_STREAM,
     client = _groq_client()
     for attempt in range(3):
         try:
+            global LLM_REQUEST_COUNT
+            LLM_REQUEST_COUNT += 1
+            print(f"[{LLM_REQUEST_COUNT}] 🚀 [Groq Request] model={model} (Stream)")
             stream = await client.chat.completions.create(
                 model=model,
                 messages=[
@@ -136,6 +141,9 @@ async def _collect_groq(system: str, user: str,
         kwargs["reasoning_effort"] = reasoning_effort
     for attempt in range(3):
         try:
+            global LLM_REQUEST_COUNT
+            LLM_REQUEST_COUNT += 1
+            print(f"[{LLM_REQUEST_COUNT}] 🚀 [Groq Request] model={model} (Collect)")
             response = await client.chat.completions.create(**kwargs)
             return response.choices[0].message.content.strip()
         except Exception as e:
@@ -448,6 +456,7 @@ async def _run_agent_turn_live(
     Tool execution: Dispatch locally, broadcast mcp_tool to UI.
     Call 2 (streaming): Agent generates final answer with tool results.
     """
+    global LLM_REQUEST_COUNT
     logger.info(f"[LIVE] 🎙 STARTING TURN: {persona_name}")
     print(f"\n[LANGGRAPH LIVE] Node: {persona_name} → model: {MODEL_LIVE_REASONING}")
 
@@ -476,6 +485,8 @@ async def _run_agent_turn_live(
     tool_calls_made = []
     try:
         await asyncio.sleep(4) # Rate-limit delay
+        LLM_REQUEST_COUNT += 1
+        print(f"[{LLM_REQUEST_COUNT}] 🚀 [Groq Request] model={MODEL_LIVE_REASONING} (Call 1: Tools)")
         print(f"[{persona_name}] Call 1 → tool decision ({MODEL_LIVE_REASONING})")
         resp1 = await client.chat.completions.create(
             model=MODEL_LIVE_REASONING,
@@ -596,6 +607,8 @@ async def _run_agent_turn_live(
 
     try:
         await asyncio.sleep(2) # Added a delay between calls
+        LLM_REQUEST_COUNT += 1
+        print(f"[{LLM_REQUEST_COUNT}] 🚀 [Groq Request] model={MODEL_LIVE_REASONING} (Call 2: Stream)")
         print(f"[{persona_name}] Call 2 → streaming final answer ({MODEL_LIVE_REASONING})")
         stream = await client.chat.completions.create(
             model=MODEL_LIVE_REASONING,
