@@ -21,6 +21,14 @@ class Settings(BaseSettings):
     neo4j_password: str = ""
     neo4j_uris: str = ""             # pipe-separated multi-instance (optional)
 
+    # ArmorIQ AI governance SDK
+    armoriq_api_key: str = ""
+    armoriq_user_id: str = ""
+    armoriq_agent_id: str = ""
+
+    # ngrok public HTTPS tunnel URL (required for ArmorIQ MCP registration)
+    ngrok_public_url: str = ""
+
     # App
     debug: bool = True
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"

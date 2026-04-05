@@ -4,9 +4,13 @@ FastAPI application entrypoint.
 
 Routes:
   POST /api/trigger-event          → kick off the LangGraph debate
+  POST /api/trigger-event-armoriq  → ArmorIQ plan+delegate + LangGraph concurrently
   GET  /api/graphrag               → standalone GraphRAG query
   GET  /api/mcp/manifest           → list MCP tools
   WS   /ws/trading-floor           → real-time streaming of debate tokens
+  POST /mcp                        → MCP tool dispatch (ArmorIQ calls this)
+  GET  /mcp/health                 → MCP liveness probe
+  GET  /mcp/manifest               → MCP tool schemas
   /mcp/tools/*                     → MCP tool endpoints (sub-router)
   /docs                            → Swagger UI
 """
@@ -21,8 +25,10 @@ from pydantic import BaseModel
 
 from backend.core.config import get_settings
 from backend.graph.graphrag import GraphRAGTransformer
-from backend.agents.trading_floor import run_trading_floor, register_queue, unregister_queue
+from backend.agents.trading_floor import run_trading_floor, register_queue, unregister_queue, _broadcast
 from backend.mcp_server.server import router as mcp_router
+from backend.mcp_server.mcp_http_server import mcp_http_router
+from backend.core.armoriq_client import trigger_via_armoriq
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -36,6 +42,7 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 Fillado backend starting up…")
+    print("[MCP HTTP] Endpoint live at /mcp")
     yield
     logger.info("🛑 Fillado backend shutting down…")
 
@@ -59,8 +66,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount MCP router
+# Mount routers
 app.include_router(mcp_router)
+app.include_router(mcp_http_router)  # ArmorIQ-facing MCP HTTP endpoint
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +126,57 @@ async def trigger_event(req: TriggerEventRequest):
         graph_context=graph_ctx,
         message="LangGraph debate initiated. Connect to /ws/trading-floor for live stream.",
     )
+
+
+# ---------------------------------------------------------------------------
+# ArmorIQ-enhanced endpoint (additive — does NOT change /api/trigger-event)
+# ---------------------------------------------------------------------------
+
+class TriggerEventArmorIQRequest(BaseModel):
+    event: str = "Transport Strike in Gujarat – Truck operators call indefinite bandh"
+    simulate_hallucination: bool = True
+
+
+@app.post("/api/trigger-event-armoriq", tags=["Market Events"])
+async def trigger_event_armoriq(req: TriggerEventArmorIQRequest):
+    """
+    ArmorIQ-enhanced trigger endpoint.
+    Runs the ArmorIQ plan→token→delegate flow AND the LangGraph debate concurrently.
+    The existing /api/trigger-event route is unchanged and fully functional without ArmorIQ.
+    """
+    transformer = GraphRAGTransformer()
+    try:
+        graph_ctx = await transformer.transform(req.event)
+    finally:
+        transformer.close()
+
+    async def _safe_run_trading_floor():
+        try:
+            await run_trading_floor(topic=req.event, graph_context=graph_ctx)
+        except Exception as exc:
+            logger.error(f"[ArmorIQ route] Trading floor crashed: {exc}")
+            await _broadcast({"type": "error", "message": f"LangGraph Error: {str(exc)}"})
+
+    # Run ArmorIQ delegation and LangGraph debate concurrently
+    armoriq_result, _ = await asyncio.gather(
+        trigger_via_armoriq(req.event, graph_ctx),
+        _safe_run_trading_floor(),
+        return_exceptions=True,
+    )
+
+    # Broadcast ArmorIQ plan result to WebSocket clients
+    if isinstance(armoriq_result, dict):
+        await _broadcast({"type": "armoriq_plan", "result": armoriq_result})
+    else:
+        armoriq_result = {"success": False, "error": str(armoriq_result)}
+
+    return {
+        "status": "debate_started",
+        "event": req.event,
+        "graph_context": graph_ctx,
+        "armoriq": armoriq_result,
+        "message": "LangGraph debate + ArmorIQ delegation initiated. Connect to /ws/trading-floor.",
+    }
 
 
 @app.get("/api/graphrag", tags=["GraphRAG"])
