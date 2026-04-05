@@ -113,7 +113,7 @@ async def append_causal_link(
         RETURN s.name AS src, type(r) AS relationship, t.name AS tgt
         """
         try:
-            with driver.session(database="neo4j") as session:
+            with driver.session() as session:
                 session.run(cypher, source=source, target=target, rel=rel_upper,
                             tier=tier, confidence=confidence).single()
             driver.close()

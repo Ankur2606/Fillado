@@ -55,7 +55,7 @@ def test_neo4j_driver(uri: str, username: str, password: str):
 def test_write(driver):
     print(f"\n[WRITE] Testing Cypher MERGE write...")
     try:
-        with driver.session(database="neo4j") as session:
+        with driver.session() as session:
             result = session.run("""
                 MERGE (s:Entity {name: $source})
                 MERGE (t:Entity {name: $target})
@@ -78,7 +78,7 @@ def test_write(driver):
 def test_read(driver):
     print(f"\n[READ] Testing Cypher READ...")
     try:
-        with driver.session(database="neo4j") as session:
+        with driver.session() as session:
             result = session.run("MATCH (n:Entity) RETURN n.name AS name LIMIT 5")
             records = [r["name"] for r in result]
             print(f"[READ] ✅ Found {len(records)} Entity nodes: {records}")
@@ -90,7 +90,7 @@ def test_read(driver):
 def cleanup(driver):
     print(f"\n[CLEANUP] Removing test nodes...")
     try:
-        with driver.session(database="neo4j") as session:
+        with driver.session() as session:
             session.run("""
                 MATCH (s:Entity {name: 'TEST_SOURCE'})
                 MATCH (t:Entity {name: 'TEST_TARGET'})
