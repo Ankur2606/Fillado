@@ -1,100 +1,348 @@
-## Fillado: The Reality-Anchored Market Intelligence Layer
+# Fillado: The Reality-Anchored Market Intelligence Layer
 
-#### An agentic, cross-lingual market causality engine. Fillado ingests real-time vernacular news, verifies events autonomously using LangGraph, and maps supply-chain disruptions to NSE stock tickers via a Neo4j Knowledge Graph to surface low-latency trading signals. Built for the ET GenAI Hackathon.
+#### An agentic, cross-lingual market causality engine. Fillado ingests real-time vernacular news, verifies events autonomously using LangGraph, and maps supply-chain disruptions to NSE stock tickers via a Neo4j Knowledge Graph to surface low-latency trading signals.
 
+### DEMO VIDEO : https://youtu.be/9HhMN0Zm38s?si=5S0QgfSTBNObq6ju
 ---
+
 # HLD
 
-<img width="1440" height="3008" alt="image" src="https://github.com/user-attachments/assets/22d343d2-225f-4e9f-8750-9da4d55c05a5" />
+<img width="680" height="1820" alt="llm_trading_architecture 1" src="https://github.com/user-attachments/assets/e21cdd09-c139-45a6-8b31-e90bde6df99e" />
 
 
 ---
-
 
 # Product Requirements Document (PRD)
 
+## 1. The Core Vision: What Are We Solving?
 
-### 1. The Core Vision: What Are We Solving?
-We are merging the "AI for the Indian Investor" track with the "Patch the Reality" theme to build a system that finds hidden market opportunities while actively preventing AI hallucinations.
+We are building a system that finds hidden market opportunities while actively preventing AI hallucinations.
 
-* **The Investor Problem:** Retail investors react to mainstream English news *after* institutional players have already moved the market. They miss the hidden supply-chain ripples caused by local events.
-* **The AI Problem:** When AI agents analyze complex market dynamics, they often spiral into hallucinated agreements, inventing fake economic impacts and burning API tokens. Furthermore, most market AI is static—it only knows the rules it was programmed with.
+### The Investor Problem
+Retail investors react to mainstream English news *after* institutional players have already moved the market. They miss hidden supply-chain effects caused by local events.
 
-**The Solution:** Fillado is an agentic intelligence layer that catches vernacular supply-chain disruptions (e.g., a Hindi news report of a factory strike) before the English market reacts. We drop this event into a "Trading Floor" where distinct AI personas debate its impact. Crucially, a **"Thought Policeman" Middleware** monitors this debate for hallucinations, forcing the agents to use hard data via an MCP server if they drift. Finally, a **Synthesis Agent** monitors the concluded debate, extracts newly discovered market connections, and dynamically updates our Neo4j Knowledge Graph.
+### The AI Problem
+AI agents analyzing markets often hallucinate, create false causal links, and waste compute. Most systems are static and don’t evolve with new market relationships.
 
-### 2. Unique Selling Propositions (USPs)
-* **Latency Arbitrage:** We turn regional noise into institutional alpha by mapping vernacular news to NSE tickers before mainstream adoption.
-* **Synthetic Market Sentiment Simulator:** Users watch distinct AI personas (The Retail Trader, The Whale, The Contrarian) debate the news in real-time, making the AI's reasoning 100% transparent.
-* **Reality-Anchored Middleware (Zero Hallucinations):** Custom middleware calculates semantic drift mid-generation. If agents hallucinate, the system interrupts them and forces them to pull real-world ET Market data.
-* **The Self-Learning Graph:** The system dynamically learns new supply chain connections from the agent debates and appends them to its own database.
-* **Ultra-Low Latency Delivery:** Alerts are pushed instantly to the Vite frontend via WebSockets.
+### The Solution
+Fillado is an agentic intelligence layer that detects vernacular supply-chain disruptions (e.g., a regional news report of a factory strike) before mainstream markets react.
 
----
-
-### 3. Feature Detailing (Simple Words for the Team)
-
-**Feature A: The Vernacular Scout & Base Graph**
-* **How it works:** A Python script scrapes local news (Hindi, Tamil, Telugu). It extracts the event and location, then queries our base Neo4j Graph Database. 
-* **The Output:** The graph connects the initial dots: *Strike $\rightarrow$ Hosur $\rightarrow$ Ashok Leyland Factory*.
-
-**Feature B: The Agentic Trading Floor (The Debate)**
-* **How it works:** The mapped event is dropped into a virtual chatroom. Three AI agents with different system prompts debate the broader market impact for exactly 3 turns. 
-* **The Output:** They simulate how real market narratives form, exploring secondary and tertiary impacts (e.g., "Ashok Leyland slowing down means their tire supplier, MRF, will also take a hit").
-
-
-**Feature C: The "Thought Policeman" Middleware (Context-Correction)**
-* **How it works:** A FastAPI proxy sits between our reasoning agents and the LLM provider. Instead of using heavy local embedding models to calculate vector drift, we leverage the blistering inference speed of the Groq API. As the heavy 70B model streams tokens, the middleware routes the last 3 generated sentences and the original objective to the ultra-fast `llama-3.1-8b-instant` model. It asks a strict binary question: *"Is this agent hallucinating or off-topic? YES or NO."*
-* **The Output:** If the 8B model flags a "YES", the middleware instantly acts as a circuit breaker and kills the connection to save tokens. It injects a hard system override: *"Stop. Context drift detected. You must use the MCP server to fetch real ET Market or NSE data to ground your reasoning."*
-
-**Feature D: The Dynamic Graph Updater (Self-Learning)**
-* **How it works:** A final "Synthesis Agent" reads the completed, hallucination-free debate transcript. If the agents logically concluded a new relationship (e.g., *Ashok Leyland Strike $\rightarrow$ negatively impacts $\rightarrow$ MRF Tires*), this agent generates a Cypher query.
-* **The Output:** The new `[:CAUSES]` or `[:IMPACTS]` relationship is permanently written to the Neo4j database. The next time a similar event occurs, Fillado already knows the ripple effect.
+The system:
+- Drops events into a **multi-agent debate system**
+- Uses a **“Thought Policeman” middleware** to prevent hallucinations
+- Forces grounding using real-world data when needed
+- Learns new market relationships via a **Synthesis Agent**
+- Continuously updates a **Neo4j Knowledge Graph**
 
 ---
 
-### 4. The MCP Server & Tools
-Model Context Protocol (MCP) lets our AI models securely access external tools. When the Middleware interrupts a hallucinating agent, the agent uses these tools to patch its reality with facts.
+## 2. Unique Selling Propositions (USPs)
 
-**Read Tools:**
-* `fetch_et_news(query, timeframe)`: Pulls verified articles from the Economic Times archive.
-* `get_nse_price(ticker)`: Fetches real-time price, volume, and bulk/block deal data.
-* `run_backtest(pattern, ticker)`: Looks up historical success rates for chart patterns.
-
-**Write Tools (For the Synthesis Agent):**
-* `append_causal_link(source_node, relationship, target_node)`: Executes the Cypher query to add new knowledge to the Neo4j graph, making the AI permanently smarter.
+- **Latency Arbitrage:** Converts regional news into early trading signals  
+- **Transparent AI Reasoning:** Multi-agent debate system simulating market perspectives  
+- **Reality-Anchored Middleware:** Detects and stops hallucinations in real-time  
+- **Self-Learning Knowledge Graph:** Continuously evolves with new causal links  
+- **Real-Time Delivery:** Instant alerts via WebSockets  
 
 ---
 
-### 5. User Flow & UI Flow
+## 3. Feature Detailing
 
-**Step 1: The Dashboard (The Radar)**
-* The user logs into the web app. They see a live feed of "Opportunity Alerts" streaming in via WebSockets.
+### Feature A: Vernacular Scout & Base Graph
+- Scrapes regional news (Hindi, Tamil, Telugu)
+- Extracts events + locations
+- Maps them onto a Neo4j knowledge graph  
 
-**Step 2: The Event Trigger**
-* A new alert pops up: *"🚨 High Confidence: Transport Strike in Gujarat."* The user clicks the alert.
-
-**Step 3: The Trading Floor (The Debate)**
-* A chat interface opens. The text streams in real-time as the Retail, Institutional, and Contrarian AIs debate.
-* *UI Polish:* If the middleware detects a hallucination, the UI flashes a red "Context Corrected" badge, showing exactly when the AI was forced to pull real data.
-
-**Step 4: The Graph Update (The "Aha!" Moment)**
-* The debate concludes. The UI displays a notification: *"🧠 Fillado has learned a new market connection: Transport Strike $\rightarrow$ Logistics Sector Drop."* A visual node-link diagram animates to show the new connection being formed.
-
-**Step 5: The Action**
-* The user is presented with the final trade signal and a back-tested chart pattern overlay to execute their strategy.
+**Output Example:**  
+`Strike → Hosur → Ashok Leyland Factory`
 
 ---
 
-### 6. High-Level Architecture
-1. **Ingestion Layer:** Scrapes regional vernacular feeds and APIs.
-2. **Middleware Proxy (The Circuit Breaker):** A FastAPI layer that intercepts LangGraph LLM requests. It uses the Groq `llama-3.1-8b-instant` small model to constantly check streaming text for semantic drift or looping, completely replacing the need for local sentence transformers.
-3. **Reasoning Layer (LangGraph):** Orchestrates the multi-agent debate (using the larger Groq `llama-3.3-70b-versatile`) and runs the Synthesis Agent to summarize the consensus.
-4. **Knowledge Core (Neo4j AuraDB & MCP Server):** Neo4j AuraDB (cloud tier) holds the evolving supply chain relationships, which are queried dynamically via our `GraphRAGTransformer`. The isolated MCP Server holds the executable tools.
-5. **Delivery Layer (FastAPI + WebSockets):** Pushes the real-time event trigger, the live debate token stream, and the new graph updates directly to the React frontend.
+### Feature B: Agentic Trading Floor (Debate)
+- Multiple AI personas debate the event:
+  - Retail Trader  
+  - Institutional Investor  
+  - Contrarian  
+
+- Runs for structured turns  
+
+**Outcome:**  
+Discovers second-order effects  
+(e.g., production slowdown → supplier impact)
 
 ---
 
-### 7. APIs, Validation, and Fallbacks
-* **External APIs:** We will integrate open-source Python libraries (`jugaad-data` or `nsetools`) to fetch real OHLCV data to simulate the ET Market feeds.
-* **Validation:** A signal is only passed to the user if the "Verification Agent" can cross-reference the vernacular news with at least one independent web source. The Graph Update tool validates Cypher syntax before executing writes to prevent database corruption.
-* **Fallbacks:** If the primary LLM provider is rate-limited, the middleware automatically routes to a fallback model. If the live NSE data source fails, the MCP server falls back to vector database embeddings of historical pricing.
+### Feature C: Thought Policeman Middleware
+- Monitors agent outputs in real-time  
+- Uses a lightweight model to detect:
+  - Hallucinations  
+  - Context drift  
+
+If triggered:
+- Stops generation immediately  
+- Forces agent to fetch real-world data  
+
+---
+
+### Feature D: Dynamic Graph Updater
+- A **Synthesis Agent** analyzes debate results  
+- Extracts validated causal relationships  
+- Writes them into Neo4j  
+
+**Example:**  
+`Ashok Leyland Strike → Impacts → MRF Tires`
+
+---
+
+## 4. MCP Server & Tools
+
+### Read Tools
+- `fetch_news(query, timeframe)`  
+- `get_market_price(ticker)`  
+- `run_backtest(pattern, ticker)`  
+
+### Write Tools
+- `append_causal_link(source, relation, target)`  
+
+---
+
+## 5. User Flow
+
+### Step 1: Dashboard
+- Live feed of opportunity alerts  
+
+### Step 2: Event Trigger
+- User clicks alert  
+- Example: *Transport Strike in Gujarat*  
+
+### Step 3: Trading Floor
+- AI debate streams in real-time  
+- Hallucination corrections shown visually  
+
+### Step 4: Graph Update
+- System learns new relationships  
+- Displays updated connections  
+
+### Step 5: Action
+- Final signal + supporting data shown  
+
+---
+
+## 6. High-Level Architecture
+
+1. **Ingestion Layer**  
+   - Scrapes regional news  
+
+2. **Middleware Proxy**  
+   - Detects hallucinations  
+   - Enforces grounding  
+
+3. **Reasoning Layer (LangGraph)**  
+   - Multi-agent debate  
+   - Synthesis agent  
+
+4. **Knowledge Core (Neo4j + MCP)**  
+   - Stores evolving relationships  
+   - Executes tools  
+
+5. **Delivery Layer (FastAPI + WebSockets)**  
+   - Streams alerts + updates  
+
+---
+
+## 7. APIs, Validation, and Fallbacks
+
+### APIs
+- Market data via open-source tools  
+
+### Validation
+- Requires cross-source verification before signals  
+
+### Fallbacks
+- Backup LLMs if rate-limited  
+- Historical data if live feeds fail  
+
+---
+
+## 8. Setup Instructions
+
+### Frontend Setup (Terminal 1)
+```bash
+cd .\frontend\
+npm run dev
+```
+
+### Backend Setup (Terminal 2)
+```powershell
+python --version
+# Should output Python 3.13.12 or similar
+python -m venv .venv
+.\.venv\Scripts\activate
+cd backend
+pip install -r requirements.txt
+cd ..
+uvicorn backend.main:app --host 0.0.0.0 --port 8000
+```
+
+---
+
+# ArmorIQ + Fillado MCP — Setup Guide
+
+## What is this?
+
+[ArmorIQ](https://platform.armoriq.ai) is an AI governance layer that adds
+plan-capture, intent-token validation, and audited delegation to your existing
+tool calls. Fillado exposes its NSE data + knowledge-graph tools as an MCP
+server so ArmorIQ can call them with full observability.
+
+---
+
+## Prerequisites
+
+- Fillado backend running (`uvicorn backend.main:app --port 8000`)
+- [ngrok](https://ngrok.com) installed (`choco install ngrok` on Windows)
+- An [ArmorIQ account](https://platform.armoriq.ai)
+- `armoriq-sdk` installed (see Step 1)
+
+---
+
+## Step-by-step Setup
+
+### Step 1 — Install armoriq-sdk
+
+```bash
+pip install armoriq-sdk
+```
+
+### Step 2 — Start ngrok
+
+Open a **separate terminal** and run:
+
+```bash
+ngrok http 8000
+```
+
+Copy the **Forwarding HTTPS URL** — it looks like:
+
+```
+https://abc123def456.ngrok-free.app
+```
+
+### Step 3 — Configure .env
+
+Add these lines to your `.env` file (see `.env.example`):
+
+```env
+# ArmorIQ credentials (get from platform.armoriq.ai → Settings → API Keys)
+ARMORIQ_API_KEY=your_armoriq_api_key_here
+ARMORIQ_USER_ID=your_armoriq_user_id_here
+ARMORIQ_AGENT_ID=your_armoriq_agent_id_here
+
+# ngrok public URL (update every time you restart ngrok)
+NGROK_PUBLIC_URL=https://abc123def456.ngrok-free.app
+```
+
+### Step 4 — Restart the backend
+
+```bash
+uvicorn backend.main:app --host 0.0.0.0 --port 8000
+```
+
+You should see on startup:
+
+```
+[MCP HTTP] Endpoint live at /mcp
+[ArmorIQ] ✅ Client initialized (agent_id=...)
+```
+
+### Step 5 — Verify MCP endpoints are publicly reachable
+
+```bash
+curl https://abc123def456.ngrok-free.app/mcp/health
+# → {"status":"ok","tools":["get_nse_price","fetch_et_news",...]}
+
+curl https://abc123def456.ngrok-free.app/mcp/manifest
+# → {"name":"fillado-mcp","version":"1.0.0","tools":[...]}
+```
+
+### Step 6 — Register on ArmorIQ platform
+
+1. Go to [platform.armoriq.ai](https://platform.armoriq.ai) → **MCP Directory**
+2. Click **Register MCP Server**
+3. Set **Name** = `fillado-mcp`
+4. Set **Manifest URL** = `https://abc123def456.ngrok-free.app/mcp/manifest`
+5. ArmorIQ will auto-read the tool schemas from your manifest
+6. Save — your tools are now available to the ArmorIQ agent runtime
+
+> Reference: [ArmorIQ MCP Directory docs](https://docs.armoriq.ai/docs/mcp-directory)
+
+### Step 7 — Run the integration test
+
+```bash
+python -m scripts.test_armoriq
+```
+
+Expected output:
+
+```
+[1] Client init: ✅ configured
+[2] MCP health: ✅ {"status": "ok", "tools": [...]}
+[3] MCP manifest: ✅ 5 tools: [...]
+[4] MCP dispatch (mock): ✅ status=200
+[5] ArmorIQ flow: ✅
+```
+
+---
+
+## Using the ArmorIQ endpoint
+
+Instead of the standard debate endpoint:
+
+```bash
+POST /api/trigger-event
+```
+
+Use the ArmorIQ-enhanced endpoint which **runs both concurrently**:
+
+```bash
+POST /api/trigger-event-armoriq
+Content-Type: application/json
+
+{ "event": "SEBI tightens F&O margin rules" }
+```
+
+The response includes both the LangGraph debate result **and** the ArmorIQ
+plan/delegation audit trail. A `armoriq_plan` WebSocket event is also broadcast
+to the frontend.
+
+---
+
+## Architecture
+
+```
+Frontend (React)
+     │
+     ├─ POST /api/trigger-event-armoriq
+     │        │
+     │        ├─ asyncio.gather(
+     │        │     trigger_via_armoriq()   ← ArmorIQ plan → token → delegate
+     │        │     run_trading_floor()     ← existing LangGraph debate (unchanged)
+     │        │  )
+     │        │
+     │        └─ broadcast armoriq_plan via WebSocket
+     │
+     └─ GET  /mcp/manifest   ← ArmorIQ reads tool schemas here
+        POST /mcp            ← ArmorIQ calls tools here (via ngrok tunnel)
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `[ArmorIQ] ⚠️ Credentials not configured` | Add `ARMORIQ_API_KEY`, `ARMORIQ_USER_ID`, `ARMORIQ_AGENT_ID` to `.env` |
+| `[ArmorIQ] ⚠️ armoriq-sdk not installed` | Run `pip install armoriq-sdk` |
+| MCP health returns 404 | Check that backend restarted after the latest code changes |
+| ngrok tunnel expired | Restart `ngrok http 8000` and update `NGROK_PUBLIC_URL` in `.env` |
+| ArmorIQ can't reach `/mcp` | Make sure you're using the **HTTPS** ngrok URL, not HTTP |
